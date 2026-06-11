@@ -200,6 +200,21 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			});
 		}
 
+		if (this.frm.fields_dict["items"].grid.get_field("product_bundle")) {
+			// restrict the version picker to enabled, submitted Product Bundles of the row's item
+			this.frm.set_query("product_bundle", "items", function (doc, cdt, cdn) {
+				let row = locals[cdt][cdn];
+
+				return {
+					filters: {
+						new_item_code: row.item_code,
+						docstatus: 1,
+						disabled: 0,
+					},
+				};
+			});
+		}
+
 		if (
 			this.frm.docstatus < 2 &&
 			this.frm.fields_dict["payment_terms_template"] &&
@@ -459,19 +474,22 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				reference_name: frm.doc.name,
 			},
 		});
+
+		if (!schedules?.length) {
+			this.make_payment_request();
+			return;
+		}
+
 		const value = await frappe.db.get_single_value(
 			"Accounts Settings",
 			"fetch_payment_schedule_in_payment_request"
 		);
 
-		if (!value || !schedules.length) {
+		if (!value) {
 			this.make_payment_request();
 			return;
 		}
-		if (!schedules || !schedules.length) {
-			frappe.msgprint(__("No pending payment schedules available."));
-			return;
-		}
+
 		schedules.forEach((schedule) => (schedule.__checked = 1));
 
 		const dialog = new frappe.ui.Dialog({
@@ -833,26 +851,24 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 								},
 								async () => {
 									// for internal customer instead of pricing rule directly apply valuation rate on item
-									const fetch_valuation_rate_for_internal_transactions =
-										await frappe.db.get_single_value(
-											"Accounts Settings",
-											"fetch_valuation_rate_for_internal_transaction"
-										);
-									if (
-										(me.frm.doc.is_internal_customer ||
-											me.frm.doc.is_internal_supplier) &&
-										fetch_valuation_rate_for_internal_transactions
-									) {
-										me.get_incoming_rate(
-											item,
-											me.frm.posting_date,
-											me.frm.posting_time,
-											me.frm.doc.doctype,
-											me.frm.doc.company
-										);
-									} else {
-										me.frm.script_manager.trigger("price_list_rate", cdt, cdn);
+									if (me.frm.doc.is_internal_customer || me.frm.doc.is_internal_supplier) {
+										const fetch_valuation_rate_for_internal_transactions =
+											await frappe.db.get_single_value(
+												"Accounts Settings",
+												"fetch_valuation_rate_for_internal_transaction"
+											);
+										if (fetch_valuation_rate_for_internal_transactions) {
+											me.get_incoming_rate(
+												item,
+												me.frm.posting_date,
+												me.frm.posting_time,
+												me.frm.doc.doctype,
+												me.frm.doc.company
+											);
+											return;
+										}
 									}
+									me.frm.script_manager.trigger("price_list_rate", cdt, cdn);
 								},
 								() => {
 									if (me.frm.doc.is_internal_customer || me.frm.doc.is_internal_supplier) {
@@ -2923,10 +2939,28 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			method: "erpnext.controllers.stock_controller.check_item_quality_inspection",
 			args: {
 				doctype: this.frm.doc.doctype,
+				docstatus: this.frm.doc.docstatus,
 				items: this.frm.doc.items,
 			},
 			freeze: true,
 			callback: function (r) {
+				if (r.message.length == 0) {
+					let type = inspection_type === "Incoming" ? "Purchase" : "Delivery";
+					let fieldname =
+						inspection_type === "Incoming"
+							? "Inspection Required before Purchase"
+							: "Inspection Required before Delivery";
+
+					frappe.msgprint({
+						title: __("Quality Inspection Not Configured"),
+						message: __(`Enable <b>{0}</b> on the Item master to proceed with {1} inspection.`, [
+							fieldname,
+							type,
+						]),
+					});
+					return;
+				}
+
 				r.message.forEach((item) => {
 					if (me.has_inspection_required(item)) {
 						let dialog_items = dialog.fields_dict.items;
@@ -2970,11 +3004,9 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		let method = "erpnext.accounts.doctype.payment_entry.payment_entry.get_payment_entry";
 		if (this.frm.doc.__onload && this.frm.doc.__onload.make_payment_via_journal_entry) {
 			if (["Sales Invoice", "Purchase Invoice"].includes(this.frm.doc.doctype)) {
-				method =
-					"erpnext.accounts.doctype.journal_entry.journal_entry.get_payment_entry_against_invoice";
+				method = "erpnext.accounts.doctype.journal_entry.mapper.get_payment_entry_against_invoice";
 			} else {
-				method =
-					"erpnext.accounts.doctype.journal_entry.journal_entry.get_payment_entry_against_order";
+				method = "erpnext.accounts.doctype.journal_entry.mapper.get_payment_entry_against_order";
 			}
 		}
 

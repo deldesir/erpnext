@@ -12,10 +12,12 @@ from erpnext.manufacturing.doctype.job_card.job_card import (
 	JobCardOverTransferError,
 	OperationMismatchError,
 	OverlapError,
+)
+from erpnext.manufacturing.doctype.job_card.mapper import (
 	make_corrective_job_card,
 	make_material_request,
 )
-from erpnext.manufacturing.doctype.job_card.job_card import (
+from erpnext.manufacturing.doctype.job_card.mapper import (
 	make_stock_entry as make_stock_entry_from_jc,
 )
 from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
@@ -194,6 +196,28 @@ class TestJobCard(ERPNextTestSuite):
 				"Work Order Operation", job_card.operation_id, "completed_qty"
 			)
 			self.assertEqual(completed_qty, job_card.for_quantity)
+
+	def test_job_card_cannot_be_submitted_while_on_hold(self):
+		# Regression for #55756: a paused (On Hold) job card must not be submittable, otherwise
+		# the document gets locked in the On Hold state with Resume/Complete no longer available.
+		job_card = frappe.get_all(
+			"Job Card",
+			filters={"work_order": self.work_order.name},
+			fields=["name", "for_quantity"],
+		)[0]
+
+		doc = frappe.get_doc("Job Card", job_card.name)
+		doc.append(
+			"time_logs",
+			{
+				"from_time": "2024-01-01 08:00:00",
+				"to_time": "2024-01-01 09:00:00",
+				"time_in_mins": 60,
+				"completed_qty": job_card.for_quantity,
+			},
+		)
+		doc.is_paused = 1
+		self.assertRaises(frappe.ValidationError, doc.submit)
 
 	def test_job_card_overlap(self):
 		wo2 = make_wo_order_test_record(item="_Test FG Item 2", qty=2)
@@ -552,7 +576,7 @@ class TestJobCard(ERPNextTestSuite):
 		corrective_job_card.submit()
 		wo.reload()
 
-		from erpnext.manufacturing.doctype.work_order.work_order import (
+		from erpnext.manufacturing.doctype.work_order.mapper import (
 			make_stock_entry as make_stock_entry_for_wo,
 		)
 
@@ -623,7 +647,7 @@ class TestJobCard(ERPNextTestSuite):
 		assertStatus("Cancelled")
 
 	def test_job_card_material_request_and_bom_details(self):
-		from erpnext.stock.doctype.material_request.material_request import make_stock_entry
+		from erpnext.stock.doctype.material_request.mapper import make_stock_entry
 
 		create_bom_with_multiple_operations()
 		work_order = make_wo_with_transfer_against_jc()
@@ -647,7 +671,7 @@ class TestJobCard(ERPNextTestSuite):
 			setup_bom,
 			setup_operations,
 		)
-		from erpnext.manufacturing.doctype.work_order.work_order import (
+		from erpnext.manufacturing.doctype.work_order.mapper import (
 			make_stock_entry as make_stock_entry_for_wo,
 		)
 		from erpnext.stock.doctype.item.test_item import make_item
@@ -788,10 +812,10 @@ class TestJobCard(ERPNextTestSuite):
 			setup_bom,
 			setup_operations,
 		)
-		from erpnext.manufacturing.doctype.work_order.work_order import make_job_card
-		from erpnext.manufacturing.doctype.work_order.work_order import (
+		from erpnext.manufacturing.doctype.work_order.mapper import (
 			make_stock_entry as make_stock_entry_for_wo,
 		)
+		from erpnext.manufacturing.doctype.work_order.work_order import make_job_card
 		from erpnext.stock.doctype.item.test_item import make_item
 		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
 
@@ -913,7 +937,7 @@ class TestJobCard(ERPNextTestSuite):
 					"qty": 1,
 					"process_loss_per": 10,
 					"cost_allocation_per": 5,
-					"type": "Scrap",
+					"secondary_item_type": "Scrap",
 				},
 			)
 			if submit:
@@ -996,7 +1020,8 @@ class TestJobCard(ERPNextTestSuite):
 			},
 		)
 		job_card.append(
-			"secondary_items", {"item_code": scrap_extra.name, "stock_qty": 5, "type": "Co-Product"}
+			"secondary_items",
+			{"item_code": scrap_extra.name, "stock_qty": 5, "secondary_item_type": "Co-Product"},
 		)
 		job_card.submit()
 
@@ -1015,7 +1040,7 @@ class TestJobCard(ERPNextTestSuite):
 		self.assertEqual(manufacturing_entry.items[2].qty, 9)
 		self.assertEqual(flt(manufacturing_entry.items[2].basic_rate, 3), 5.556)
 		self.assertEqual(manufacturing_entry.items[3].item_code, scrap_extra.name)
-		self.assertEqual(manufacturing_entry.items[3].type, "Co-Product")
+		self.assertEqual(manufacturing_entry.items[3].secondary_item_type, "Co-Product")
 		self.assertEqual(manufacturing_entry.items[3].qty, 5)
 		self.assertEqual(manufacturing_entry.items[3].basic_rate, 0)
 
@@ -1060,7 +1085,9 @@ class TestJobCard(ERPNextTestSuite):
 			)
 
 		job_card = frappe.get_last_doc("Job Card", {"work_order": self.work_order.name})
-		job_card.append("secondary_items", {"item_code": "_Test Item", "stock_qty": 2, "type": "Scrap"})
+		job_card.append(
+			"secondary_items", {"item_code": "_Test Item", "stock_qty": 2, "secondary_item_type": "Scrap"}
+		)
 		job_card.append(
 			"time_logs",
 			{
@@ -1072,7 +1099,7 @@ class TestJobCard(ERPNextTestSuite):
 		job_card.save()
 		job_card.submit()
 
-		from erpnext.manufacturing.doctype.work_order.work_order import (
+		from erpnext.manufacturing.doctype.work_order.mapper import (
 			make_stock_entry as make_stock_entry_for_wo,
 		)
 
@@ -1091,10 +1118,10 @@ class TestJobCard(ERPNextTestSuite):
 			setup_bom,
 			setup_operations,
 		)
-		from erpnext.manufacturing.doctype.work_order.work_order import make_job_card
-		from erpnext.manufacturing.doctype.work_order.work_order import (
+		from erpnext.manufacturing.doctype.work_order.mapper import (
 			make_stock_entry as make_stock_entry_for_wo,
 		)
+		from erpnext.manufacturing.doctype.work_order.work_order import make_job_card
 		from erpnext.stock.doctype.item.test_item import make_item
 		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
 

@@ -810,7 +810,7 @@ class TestAccountsController(ERPNextTestSuite):
 
 	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_internal_transfer_at_arms_length_price": 1})
 	def test_16_internal_transfer_at_arms_length_price(self):
-		from erpnext.accounts.doctype.sales_invoice.sales_invoice import make_inter_company_purchase_invoice
+		from erpnext.accounts.doctype.sales_invoice.mapper import make_inter_company_purchase_invoice
 		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
 
 		prepare_data_for_internal_transfer()
@@ -987,6 +987,34 @@ class TestAccountsController(ERPNextTestSuite):
 
 		self.assertEqual(sinv.taxes[0].account_head, "_Test Account Excise Duty - _TC")
 		self.assertEqual(sinv.total_taxes_and_charges, 5)
+
+	@ERPNextTestSuite.change_settings(
+		"Accounts Settings",
+		{"add_taxes_from_item_tax_template": 1, "add_taxes_from_taxes_and_charges_template": 0},
+	)
+	def test_19b_fetch_taxes_from_item_tax_template_purchase_invoice(self):
+		pinv = frappe.new_doc("Purchase Invoice")
+		pinv.supplier = "_Test Supplier"
+		pinv.company = self.company
+		pinv.currency = "INR"
+		item = pinv.append(
+			"items",
+			{
+				"item_code": "_Test Item",
+				"qty": 1,
+				"rate": 50,
+				"item_tax_template": "_Test Account Excise Duty @ 10 - _TC",
+			},
+		)
+
+		item_details = pinv.fetch_item_details(item)
+		pinv.add_taxes_from_item_template(item, item_details)
+
+		self.assertEqual(len(pinv.taxes), 1)
+		tax_row = pinv.taxes[0]
+		self.assertEqual(tax_row.account_head, "_Test Account Excise Duty - _TC")
+		self.assertEqual(tax_row.category, "Total")
+		self.assertEqual(tax_row.add_deduct_tax, "Add")
 
 	def test_20_journal_against_sales_invoice(self):
 		# Invoice in Foreign Currency
@@ -2247,7 +2275,7 @@ class TestAccountsController(ERPNextTestSuite):
 		Test that additional discount amount is not copied repeatedly
 		when creating multiple delivery notes from a single sales order with discount_amount set
 		"""
-		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+		from erpnext.selling.doctype.sales_order.mapper import make_delivery_note
 		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
 
 		# Create a sales order with discount amount
@@ -2283,7 +2311,7 @@ class TestAccountsController(ERPNextTestSuite):
 		Test that additional discount amount is not copied repeatedly
 		when creating multiple purchase receipts from a single purchase order with discount_amount set
 		"""
-		from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+		from erpnext.buying.doctype.purchase_order.mapper import make_purchase_receipt
 		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
 
 		# Create a purchase order with discount amount
@@ -2319,7 +2347,7 @@ class TestAccountsController(ERPNextTestSuite):
 		Test that discount amount is partially applied when some discount
 		has already been used in previous mapped transactions
 		"""
-		from erpnext.selling.doctype.sales_order.sales_order import make_sales_invoice
+		from erpnext.selling.doctype.sales_order.mapper import make_sales_invoice
 		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
 
 		# Create a sales order with discount amount
@@ -2357,7 +2385,7 @@ class TestAccountsController(ERPNextTestSuite):
 		Test that discount amount is not adjusted when additional_discount_percentage
 		is set in the source document (as it will be recalculated based on percentage)
 		"""
-		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+		from erpnext.selling.doctype.sales_order.mapper import make_delivery_note
 		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
 
 		# Create a sales order with discount percentage instead of amount
@@ -2385,7 +2413,7 @@ class TestAccountsController(ERPNextTestSuite):
 		Test that discount amount is correctly adjusted when multiple return invoices
 		are created against the same original invoice to prevent over-returning discount
 		"""
-		from erpnext.accounts.doctype.sales_invoice.sales_invoice import make_sales_return
+		from erpnext.accounts.doctype.sales_invoice.mapper import make_sales_return
 
 		# Create original sales invoice with discount
 		si = create_sales_invoice(qty=10, rate=100, do_not_submit=True)
