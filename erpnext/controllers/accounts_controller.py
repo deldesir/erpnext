@@ -38,7 +38,7 @@ from erpnext.accounts.party import (
 from erpnext.accounts.utils import (
 	get_advance_payment_doctypes as _get_advance_payment_doctypes,
 )
-from erpnext.accounts.utils import validate_fiscal_year
+from erpnext.accounts.utils import get_fiscal_year, validate_fiscal_year
 from erpnext.controllers.print_settings import (
 	set_print_templates_for_item_table,
 	set_print_templates_for_taxes,
@@ -114,6 +114,26 @@ class AccountsController(TransactionBase):
 				from erpnext.accounts.services.payment_schedule import PaymentScheduleService
 
 				PaymentScheduleService(self).set_payment_schedule()
+
+	def before_insert(self):
+		self.clear_clearance_date_on_amend()
+
+	def clear_clearance_date_on_amend(self):
+		"""Drop the bank reconciliation clearance date copied over while amending.
+
+		The framework copies `no_copy` fields when amending, so a reconciled
+		voucher would carry a stale clearance date into its amendment even though
+		the linked bank transaction gets unreconciled on cancellation.
+		"""
+		if not self.get("amended_from"):
+			return
+
+		if self.meta.has_field("clearance_date"):
+			self.clearance_date = None
+
+		for payment in self.get("payments") or []:
+			if payment.meta.has_field("clearance_date"):
+				payment.clearance_date = None
 
 	def on_update(self):
 		from erpnext.controllers.taxes_and_totals import process_item_wise_tax_details
@@ -640,21 +660,29 @@ class AccountsController(TransactionBase):
 			self.calculate_contribution()
 
 	def validate_date_with_fiscal_year(self):
-		if self.meta.get_field("fiscal_year"):
-			date_field = None
-			if self.meta.get_field("posting_date"):
-				date_field = "posting_date"
-			elif self.meta.get_field("transaction_date"):
-				date_field = "transaction_date"
+		date_field = None
+		if self.meta.get_field("posting_date"):
+			date_field = "posting_date"
+		elif self.meta.get_field("transaction_date"):
+			date_field = "transaction_date"
 
-			if date_field and self.get(date_field):
-				validate_fiscal_year(
-					self.get(date_field),
-					self.fiscal_year,
-					self.company,
-					self.meta.get_label(date_field),
-					self,
-				)
+		if not date_field or not self.get(date_field):
+			return
+
+		if self.meta.get_field("fiscal_year"):
+			validate_fiscal_year(
+				self.get(date_field),
+				self.fiscal_year,
+				self.company,
+				self.meta.get_label(date_field),
+				self,
+			)
+		else:
+			get_fiscal_year(
+				self.get(date_field),
+				company=self.company,
+				label=self.meta.get_label(date_field),
+			)
 
 	def validate_due_date(self):
 		if self.get("is_pos") or self.doctype not in ["Sales Invoice", "Purchase Invoice"]:
@@ -1555,13 +1583,13 @@ def update_invoice_status():
 
 		total = (
 			frappe.qb.terms.Case()
-			.when(invoice.disable_rounded_total, invoice.grand_total)
+			.when(invoice.disable_rounded_total == 1, invoice.grand_total)
 			.else_(invoice.rounded_total)
 		)
 
 		base_total = (
 			frappe.qb.terms.Case()
-			.when(invoice.disable_rounded_total, invoice.base_grand_total)
+			.when(invoice.disable_rounded_total == 1, invoice.base_grand_total)
 			.else_(invoice.base_rounded_total)
 		)
 
@@ -1574,7 +1602,7 @@ def update_invoice_status():
 			& (invoice.outstanding_amount > 0)
 			& (invoice.status.like("Unpaid%") | invoice.status.like("Partly Paid%"))
 			& (
-				((invoice.is_pos & invoice.due_date < today) | is_overdue)
+				(((invoice.is_pos == 1) & (invoice.due_date < today)) | is_overdue)
 				if doctype == "Sales Invoice"
 				else is_overdue
 			)

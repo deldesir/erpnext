@@ -51,24 +51,17 @@ class ExpenseAccountService:
 				if doc.update_stock and item.warehouse and (not item.from_warehouse):
 					_inv_dict = doc.get_inventory_account_dict(item, inventory_account_map)
 
-					if for_validate and item.expense_account and item.expense_account != _inv_dict["account"]:
-						msg = _(
-							"Row {0}: Expense Head changed to {1} because account {2} is not linked to warehouse {3} or it is not the default inventory account"
-						).format(
-							item.idx,
-							frappe.bold(_inv_dict["account"]),
-							frappe.bold(item.expense_account),
-							frappe.bold(item.warehouse),
-						)
-						frappe.msgprint(msg, title=_("Expense Head Changed"))
 					item.expense_account = _inv_dict["account"]
 				else:
 					# check if 'Stock Received But Not Billed' account is credited in Purchase receipt or not
 					if item.purchase_receipt:
-						negative_expense_booked_in_pr = frappe.db.sql(
-							"""select name from `tabGL Entry`
-							where voucher_type='Purchase Receipt' and voucher_no=%s and account = %s""",
-							(item.purchase_receipt, stock_not_billed_account),
+						negative_expense_booked_in_pr = frappe.db.exists(
+							"GL Entry",
+							{
+								"voucher_type": "Purchase Receipt",
+								"voucher_no": item.purchase_receipt,
+								"account": stock_not_billed_account,
+							},
 						)
 
 						if negative_expense_booked_in_pr:

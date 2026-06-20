@@ -411,6 +411,89 @@ class TestItem(ERPNextTestSuite):
 
 		self.assertRaises(InvalidItemAttributeValueError, attribute.save)
 
+	def test_rename_attribute_value_updates_variants(self):
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item-L", force=1)
+
+		variant = create_variant("_Test Variant Item", {"Test Size": "Large"})
+		variant.save()
+
+		attribute = frappe.get_doc("Item Attribute", "Test Size")
+		for row in attribute.item_attribute_values:
+			if row.attribute_value == "Large":
+				row.attribute_value = "Larger"
+				break
+
+		def restore_test_size_large():
+			doc = frappe.get_doc("Item Attribute", "Test Size")
+			for row in doc.item_attribute_values:
+				if row.attribute_value == "Larger":
+					row.attribute_value = "Large"
+					break
+			frappe.flags.attribute_values = None
+			doc.save()
+
+		self.addCleanup(restore_test_size_large)
+
+		frappe.flags.attribute_values = None
+		attribute.save()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Item Variant Attribute",
+				{"parent": variant.name, "attribute": "Test Size"},
+				"attribute_value",
+			),
+			"Larger",
+		)
+
+	def test_swapped_attribute_value_renames_update_variants(self):
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item-L", force=1)
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item-S", force=1)
+
+		large_variant = create_variant("_Test Variant Item", {"Test Size": "Large"})
+		large_variant.save()
+
+		small_variant = create_variant("_Test Variant Item", {"Test Size": "Small"})
+		small_variant.save()
+
+		attribute = frappe.get_doc("Item Attribute", "Test Size")
+		original_values = {row.name: row.attribute_value for row in attribute.item_attribute_values}
+
+		def restore_test_size_values():
+			doc = frappe.get_doc("Item Attribute", "Test Size")
+			for row in doc.item_attribute_values:
+				row.attribute_value = original_values[row.name]
+			frappe.flags.attribute_values = None
+			doc.save()
+
+		self.addCleanup(restore_test_size_values)
+
+		for row in attribute.item_attribute_values:
+			if row.attribute_value == "Large":
+				row.attribute_value = "Small"
+			elif row.attribute_value == "Small":
+				row.attribute_value = "Large"
+
+		frappe.flags.attribute_values = None
+		attribute.save()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Item Variant Attribute",
+				{"parent": large_variant.name, "attribute": "Test Size"},
+				"attribute_value",
+			),
+			"Small",
+		)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Item Variant Attribute",
+				{"parent": small_variant.name, "attribute": "Test Size"},
+				"attribute_value",
+			),
+			"Large",
+		)
+
 	def test_make_item_variant(self):
 		frappe.delete_doc_if_exists("Item", "_Test Variant Item-L", force=1)
 
@@ -997,13 +1080,24 @@ class TestItem(ERPNextTestSuite):
 		for item_code, properties in items.items():
 			make_item(item_code, properties)
 
-			serial_and_batch_bundle = frappe.db.get_value(
+			stock_entry_bundle = frappe.db.get_value(
 				"Stock Entry Detail", {"docstatus": 1, "item_code": item_code}, "serial_and_batch_bundle"
+			)
+			self.assertFalse(stock_entry_bundle)
+
+			serial_and_batch_bundle = frappe.db.get_value(
+				"Stock Ledger Entry",
+				{
+					"voucher_type": "Stock Reconciliation",
+					"is_cancelled": 0,
+					"item_code": item_code,
+				},
+				"serial_and_batch_bundle",
 			)
 			self.assertTrue(serial_and_batch_bundle)
 
 			sabb_qty = frappe.db.get_value("Serial and Batch Bundle", serial_and_batch_bundle, "total_qty")
-			self.assertEqual(sabb_qty, properties["opening_stock"])
+			self.assertEqual(abs(sabb_qty), properties["opening_stock"])
 
 
 def set_item_variant_settings(fields):
