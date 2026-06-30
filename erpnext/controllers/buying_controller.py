@@ -129,7 +129,7 @@ class BuyingController(SubcontractingController):
 			msg += f"<li>{po} ({date})</li>"
 		msg += "</ul>"
 
-		frappe.throw(_(msg))
+		frappe.throw(msg)
 
 	def create_package_for_transfer(self) -> None:
 		"""Create serial and batch package for Sourece Warehouse in case of inter transfer."""
@@ -287,7 +287,7 @@ class BuyingController(SubcontractingController):
 		if self.is_return and len(not_cancelled_asset):
 			frappe.throw(
 				_(
-					"{} has submitted assets linked to it. You need to cancel the assets to create purchase return."
+					"{0} has submitted assets linked to it. You need to cancel the assets to create purchase return."
 				).format(self.return_against),
 				title=_("Not Allowed"),
 			)
@@ -738,7 +738,7 @@ class BuyingController(SubcontractingController):
 				frappe.throw(
 					_("Row #{idx}: {field_label} can not be negative for item {item_code}.").format(
 						idx=item_row["idx"],
-						field_label=frappe.get_meta(item_row.doctype).get_label(fieldname),
+						field_label=_(frappe.get_meta(item_row.doctype).get_label(fieldname)),
 						item_code=frappe.bold(item_row["item_code"]),
 					)
 				)
@@ -1123,15 +1123,14 @@ class BuyingController(SubcontractingController):
 					asset = frappe.get_doc("Asset", asset.name)
 					if delete_asset and is_auto_create_enabled:
 						# need to delete movements to delete assets otherwise throws link exists error
-						movements = frappe.db.sql(
-							"""SELECT asm.name
-							FROM `tabAsset Movement` asm, `tabAsset Movement Item` asm_item
-							WHERE asm_item.parent=asm.name and asm_item.asset=%s""",
-							asset.name,
-							as_dict=1,
+						movements = frappe.get_all(
+							"Asset Movement Item",
+							filters={"asset": asset.name},
+							pluck="parent",
+							limit_page_length=0,  # delete every movement of the asset (no default 20 cap)
 						)
 						for movement in movements:
-							frappe.delete_doc("Asset Movement", movement.name, force=1)
+							frappe.delete_doc("Asset Movement", movement, force=1)
 						frappe.delete_doc("Asset", asset.name, force=1)
 						continue
 
@@ -1224,17 +1223,12 @@ def validate_item_type(doc, fieldname, message):
 	if not items:
 		return
 
-	item_list = ", ".join(["%s" % frappe.db.escape(d) for d in items])
-
-	invalid_items = [
-		d[0]
-		for d in frappe.db.sql(
-			f"""
-		select item_code from tabItem where name in ({item_list}) and {fieldname}=0
-		""",
-			as_list=True,
-		)
-	]
+	invalid_items = frappe.get_all(
+		"Item",
+		filters={"name": ["in", items], fieldname: 0},
+		pluck="item_code",
+		limit_page_length=0,  # validate every item in the document (no default 20 cap)
+	)
 
 	if invalid_items:
 		items = ", ".join([d for d in invalid_items])

@@ -217,15 +217,14 @@ def get_issue_list(doctype, txt, filters, limit_start, limit_page_length=20, ord
 
 
 @frappe.whitelist()
-def set_multiple_status(names: str, status: str):
-	for name in json.loads(names):
+def set_multiple_status(names: str | list, status: str):
+	for name in frappe.parse_json(names):
 		set_status(name, status)
 
 
 @frappe.whitelist()
 def set_status(name: str, status: str):
 	frappe.has_permission("Issue", "write", name, throw=True)
-
 	frappe.db.set_value("Issue", name, "status", status)
 
 

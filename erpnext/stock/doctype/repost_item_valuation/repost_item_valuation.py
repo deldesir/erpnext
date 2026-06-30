@@ -22,6 +22,7 @@ from erpnext.stock.stock_ledger import (
 	get_items_to_be_repost,
 	repost_future_sle,
 )
+from erpnext.stock.utils import get_combine_datetime
 
 RecoverableErrors = (JobTimeoutException, QueryDeadlockError, QueryTimeoutError)
 
@@ -93,7 +94,7 @@ class RepostItemValuation(Document):
 		self.validate_recreate_stock_ledgers()
 
 	def set_default_posting_time(self):
-		if not self.posting_time:
+		if self.posting_time is None:
 			self.posting_time = nowtime()
 
 		if not self.posting_date:
@@ -208,7 +209,7 @@ class RepostItemValuation(Document):
 			):
 				frappe.msgprint(_("Caution: This might alter frozen accounts."))
 				return
-			frappe.throw(_("You cannot repost item valuation before {}").format(acc_frozen_till_date))
+			frappe.throw(_("You cannot repost item valuation before {0}").format(acc_frozen_till_date))
 
 	def reset_field_values(self):
 		if self.based_on == "Transaction":
@@ -321,31 +322,32 @@ class RepostItemValuation(Document):
 		if self.based_on != "Item and Warehouse":
 			return
 
-		filters = {
-			"item_code": self.item_code,
-			"warehouse": self.warehouse,
-			"name": self.name,
-			"posting_date": self.posting_date,
-			"posting_time": self.posting_time,
-		}
-
-		frappe.db.sql(
-			"""
-			update `tabRepost Item Valuation`
-			set status = 'Skipped'
-			WHERE item_code = %(item_code)s
-				and warehouse = %(warehouse)s
-				and name != %(name)s
-				and TIMESTAMP(posting_date, posting_time) > TIMESTAMP(%(posting_date)s, %(posting_time)s)
-				and docstatus = 1
-				and status = 'Queued'
-				and based_on = 'Item and Warehouse'
-				""",
-			filters,
-		)
+		riv = frappe.qb.DocType("Repost Item Valuation")
+		(
+			frappe.qb.update(riv)
+			.set(riv.status, "Skipped")
+			.where(
+				(riv.item_code == self.item_code)
+				& (riv.warehouse == self.warehouse)
+				& (riv.name != self.name)
+				# CombineDatetime on the column is portable (TIMESTAMP() is MySQL-only) and keeps the
+				# original NULL semantics (rows with NULL posting_time stay excluded); the RHS is this
+				# doc's own (always-set) posting datetime, computed in Python.
+				& (
+					CombineDatetime(riv.posting_date, riv.posting_time)
+					> get_combine_datetime(self.posting_date, self.posting_time)
+				)
+				& (riv.docstatus == 1)
+				& (riv.status == "Queued")
+				& (riv.based_on == "Item and Warehouse")
+			)
+		).run()
 
 	def _recalculate_valuation_rate(self):
 		doc = frappe.get_doc(self.voucher_type, self.voucher_no)
+		if doc.get("is_internal_supplier"):
+			doc.set_sales_incoming_rate_for_internal_transfer()
+
 		doc.update_valuation_rate()
 		for item in doc.items:
 			item.db_set("valuation_rate", item.valuation_rate)
@@ -362,8 +364,8 @@ class RepostItemValuation(Document):
 
 
 @frappe.whitelist()
-def bulk_restart_reposting(names: str):
-	names = json.loads(names)
+def bulk_restart_reposting(names: str | list):
+	names = frappe.parse_json(names)
 	for name in names:
 		doc = frappe.get_doc("Repost Item Valuation", name)
 		if doc.status != "Failed":
@@ -777,6 +779,7 @@ def make_reposting_for_accounting_ledgers(transactions, company, repost_doc):
 		if reposting_map.get((voucher_type, voucher_no)):
 			continue
 
+		frappe.db.savepoint("repost_accounting_ledger")
 		try:
 			new_repost_doc = frappe.new_doc("Repost Item Valuation")
 			new_repost_doc.company = company
@@ -787,7 +790,7 @@ def make_reposting_for_accounting_ledgers(transactions, company, repost_doc):
 			new_repost_doc.flags.ignore_permissions = True
 			new_repost_doc.submit()
 		except Exception:
-			pass
+			frappe.db.rollback(save_point="repost_accounting_ledger")
 
 
 def get_existing_reposting_only_gl_entries(reposting_reference):

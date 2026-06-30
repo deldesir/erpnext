@@ -143,7 +143,7 @@ class Item(Document):
 		taxes: DF.Table[ItemTax]
 		total_projected_qty: DF.Float
 		uoms: DF.Table[UOMConversionDetail]
-		valuation_method: DF.Literal["", "FIFO", "Moving Average", "LIFO"]
+		valuation_method: DF.Literal["", "FIFO", "Moving Average", "LIFO", "Standard Cost"]
 		valuation_rate: DF.Currency
 		variant_based_on: DF.Literal["Item Attribute", "Manufacturer"]
 		variant_of: DF.Link | None
@@ -239,6 +239,7 @@ class Item(Document):
 		self.validate_item_defaults()
 		self.validate_auto_reorder_enabled_in_stock_settings()
 		self.cant_change()
+		self.validate_standard_cost_change()
 		self.validate_item_tax_net_rate_range()
 
 		if not self.is_new():
@@ -463,7 +464,7 @@ class Item(Document):
 
 	def validate_item_type(self):
 		if self.has_serial_no == 1 and self.is_stock_item == 0 and not self.is_fixed_asset:
-			frappe.throw(_("'Has Serial No' can not be 'Yes' for non-stock item"))
+			frappe.throw(_("'Has Serial No' cannot be 'Yes' for non-stock item"))
 
 		if self.has_serial_no == 0 and self.serial_no_series:
 			self.serial_no_series = None
@@ -534,14 +535,16 @@ class Item(Document):
 			for item_barcode in self.barcodes:
 				options = frappe.get_meta("Item Barcode").get_options("barcode_type").split("\n")
 				if item_barcode.barcode:
-					duplicate = frappe.db.sql(
-						"""select parent from `tabItem Barcode` where barcode = %s and parent != %s""",
-						(item_barcode.barcode, self.name),
+					duplicate = frappe.get_all(
+						"Item Barcode",
+						filters={"barcode": item_barcode.barcode, "parent": ["!=", self.name]},
+						pluck="parent",
+						limit=1,  # only the first conflicting item is reported
 					)
 					if duplicate:
 						frappe.throw(
 							_("Barcode {0} already used in Item {1}").format(
-								item_barcode.barcode, duplicate[0][0]
+								item_barcode.barcode, duplicate[0]
 							)
 						)
 
@@ -602,12 +605,8 @@ class Item(Document):
 
 	def stock_ledger_created(self):
 		if not hasattr(self, "_stock_ledger_created"):
-			self._stock_ledger_created = len(
-				frappe.db.sql(
-					"""select name from `tabStock Ledger Entry`
-				where item_code = %s and is_cancelled = 0 limit 1""",
-					self.name,
-				)
+			self._stock_ledger_created = bool(
+				frappe.db.exists("Stock Ledger Entry", {"item_code": self.name, "is_cancelled": 0})
 			)
 		return self._stock_ledger_created
 
@@ -618,26 +617,18 @@ class Item(Document):
 		if self.is_new():
 			return
 
-		frappe.db.sql(
-			"""
-				UPDATE `tabItem Price`
-				SET
-					item_name=%(item_name)s,
-					item_description=%(item_description)s,
-					brand=%(brand)s
-				WHERE item_code=%(item_code)s
-			""",
-			dict(
-				item_name=self.item_name,
-				item_description=self.description,
-				brand=self.brand,
-				item_code=self.name,
-			),
-		)
+		item_price = frappe.qb.DocType("Item Price")
+		(
+			frappe.qb.update(item_price)
+			.set(item_price.item_name, self.item_name)
+			.set(item_price.item_description, self.description)
+			.set(item_price.brand, self.brand)
+			.where(item_price.item_code == self.name)
+		).run()
 
 	def on_trash(self):
-		frappe.db.sql("""delete from tabBin where item_code=%s""", self.name)
-		frappe.db.sql("delete from `tabItem Price` where item_code=%s", self.name)
+		frappe.db.delete("Bin", {"item_code": self.name})
+		frappe.db.delete("Item Price", {"item_code": self.name})
 		for variant_of in frappe.get_all("Item", filters={"variant_of": self.name}):
 			frappe.delete_doc("Item", variant_of.name)
 
@@ -669,15 +660,15 @@ class Item(Document):
 		frappe.db.delete("Bin", {"item_code": old_name})
 
 	def validate_duplicate_item_in_stock_reconciliation(self, old_name, new_name):
-		records = frappe.db.sql(
-			""" SELECT parent, COUNT(*) as records
-			FROM `tabStock Reconciliation Item`
-			WHERE item_code = %s and docstatus = 1
-			GROUP By item_code, warehouse, parent
-			HAVING records > 1
-		""",
-			new_name,
-			as_dict=1,
+		sri = frappe.qb.DocType("Stock Reconciliation Item")
+		records = (
+			frappe.qb.from_(sri)
+			.select(sri.parent, Count("*").as_("records"))
+			.where((sri.item_code == new_name) & (sri.docstatus == 1))
+			.groupby(sri.item_code, sri.warehouse, sri.parent)
+			# HAVING references the aggregate itself; postgres rejects the SELECT alias here
+			.having(Count("*") > 1)
+			.run(as_dict=1)
 		)
 
 		if not records:
@@ -757,32 +748,26 @@ class Item(Document):
 			return
 
 		if self.db_get("description") != self.description:
-			frappe.db.sql(
-				"""
-				update `tabBOM`
-				set description = %s
-				where item = %s and docstatus < 2
-			""",
-				(self.description, self.name),
-			)
+			bom = frappe.qb.DocType("BOM")
+			(
+				frappe.qb.update(bom)
+				.set(bom.description, self.description)
+				.where((bom.item == self.name) & (bom.docstatus < 2))
+			).run()
 
-			frappe.db.sql(
-				"""
-				update `tabBOM Item`
-				set description = %s
-				where item_code = %s and docstatus < 2
-			""",
-				(self.description, self.name),
-			)
+			bom_item = frappe.qb.DocType("BOM Item")
+			(
+				frappe.qb.update(bom_item)
+				.set(bom_item.description, self.description)
+				.where((bom_item.item_code == self.name) & (bom_item.docstatus < 2))
+			).run()
 
-			frappe.db.sql(
-				"""
-				update `tabBOM Explosion Item`
-				set description = %s
-				where item_code = %s and docstatus < 2
-			""",
-				(self.description, self.name),
-			)
+			bom_explosion_item = frappe.qb.DocType("BOM Explosion Item")
+			(
+				frappe.qb.update(bom_explosion_item)
+				.set(bom_explosion_item.description, self.description)
+				.where((bom_explosion_item.item_code == self.name) & (bom_explosion_item.docstatus < 2))
+			).run()
 
 	def validate_item_defaults(self):
 		companies = {row.company for row in self.item_defaults}
@@ -1075,6 +1060,30 @@ class Item(Document):
 			# copy variant_of value for each attribute row
 			for d in self.attributes:
 				d.variant_of = self.variant_of
+
+	def validate_standard_cost_change(self):
+		"""Once stock exists, an item's valuation method cannot be switched to or from Standard
+		Cost — either change would leave existing stock valued on a basis the ledger never
+		recorded."""
+		if not self.is_standard_cost_valuation_change():
+			return
+
+		if self.stock_ledger_created():
+			frappe.throw(
+				_(
+					"Valuation Method cannot be changed to or from 'Standard Cost' for {0} because stock transactions already exist for it."
+				).format(frappe.bold(self.name))
+			)
+
+	def is_standard_cost_valuation_change(self):
+		"""True if this save switches the valuation method into or out of Standard Cost."""
+		if self.is_new() or not self.has_value_changed("valuation_method"):
+			return False
+
+		previous = self.get_doc_before_save()
+		was_standard = previous and previous.valuation_method == "Standard Cost"
+		is_standard = self.valuation_method == "Standard Cost"
+		return bool(was_standard or is_standard)
 
 	def cant_change(self):
 		if self.is_new():
@@ -1380,14 +1389,17 @@ def check_stock_uom_with_bin(item, stock_uom):
 				).format(item)
 			)
 
-	bin_list = frappe.db.sql(
-		"""
-			select * from `tabBin` where item_code = %s
-				and (reserved_qty > 0 or ordered_qty > 0 or indented_qty > 0 or planned_qty > 0)
-				and stock_uom != %s
-			""",
-		(item, stock_uom),
-		as_dict=1,
+	bin_list = frappe.get_all(
+		"Bin",
+		filters={"item_code": item, "stock_uom": ["!=", stock_uom]},
+		or_filters=[
+			["reserved_qty", ">", 0],
+			["ordered_qty", ">", 0],
+			["indented_qty", ">", 0],
+			["planned_qty", ">", 0],
+		],
+		pluck="name",  # only used as an existence check below
+		limit=1,
 	)
 
 	if bin_list:
@@ -1398,7 +1410,8 @@ def check_stock_uom_with_bin(item, stock_uom):
 		)
 
 	# No SLE or documents against item. Bin UOM can be changed safely.
-	frappe.db.sql("""update `tabBin` set stock_uom=%s where item_code=%s""", (stock_uom, item))
+	bin_dt = frappe.qb.DocType("Bin")
+	frappe.qb.update(bin_dt).set(bin_dt.stock_uom, stock_uom).where(bin_dt.item_code == item).run()
 
 
 def get_item_defaults(item_code, company):
@@ -1468,19 +1481,16 @@ def get_uom_conv_factor(uom: str | None, stock_uom: str | None):
 	# 			 g -> mg = 1000
 	# 			 g -> kg = 0.001
 	# therefore	 kg -> mg = 1000  / 0.001 = 1,000,000
-	intermediate_match = frappe.db.sql(
-		"""
-			select (first.value / second.value) as value
-			from `tabUOM Conversion Factor` first
-			join `tabUOM Conversion Factor` second
-				on first.from_uom = second.from_uom
-			where
-				first.to_uom = %(to_uom)s
-				and second.to_uom = %(from_uom)s
-			limit 1
-			""",
-		{"to_uom": to_uom, "from_uom": from_uom},
-		as_dict=1,
+	first = frappe.qb.DocType("UOM Conversion Factor").as_("first")
+	second = frappe.qb.DocType("UOM Conversion Factor").as_("second")
+	intermediate_match = (
+		frappe.qb.from_(first)
+		.join(second)
+		.on(first.from_uom == second.from_uom)
+		.select((first.value / second.value).as_("value"))
+		.where((first.to_uom == to_uom) & (second.to_uom == from_uom))
+		.limit(1)
+		.run(as_dict=1)
 	)
 
 	if intermediate_match:
@@ -1523,7 +1533,9 @@ def validate_item_default_company_links(item_defaults: list[ItemDefault]) -> Non
 				company = frappe.db.get_value(doctype, item_default.get(field), "company", cache=True)
 				if company and company != item_default.company:
 					frappe.throw(
-						_("Row #{}: {} {} doesn't belong to Company {}. Please select valid {}.").format(
+						_(
+							"Row #{0}: {1} {2} does not belong to Company {3}. Please select valid {4}."
+						).format(
 							item_default.idx,
 							doctype,
 							frappe.bold(item_default.get(field)),

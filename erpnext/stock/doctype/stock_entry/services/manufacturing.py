@@ -3,7 +3,7 @@ from collections import defaultdict
 
 import frappe
 from frappe import _, bold
-from frappe.query_builder.functions import Sum
+from frappe.query_builder.functions import Max, Min, Sum
 from frappe.utils import ceil, cint, flt, get_link_to_form
 
 from erpnext.manufacturing.doctype.bom.bom import add_additional_cost
@@ -124,7 +124,8 @@ class BaseManufactureStockEntry(BaseStockEntry):
 					self.doc.process_loss_qty = flt(process_loss_qty, precision)
 
 					frappe.msgprint(
-						_("The Process Loss Qty has reset as per job cards Process Loss Qty"), alert=True
+						_("The Process Loss Qty has been reset as per the Job Card's Process Loss Qty"),
+						alert=True,
 					)
 
 		if not self.doc.process_loss_percentage and not self.doc.process_loss_qty:
@@ -1005,11 +1006,14 @@ def get_secondary_items_from_job_card(work_order, jc_name=None):
 		.select(
 			Sum(job_card_secondary_item.stock_qty).as_("stock_qty"),
 			job_card_secondary_item.item_code,
-			job_card_secondary_item.item_name,
-			job_card_secondary_item.description,
-			job_card_secondary_item.stock_uom,
+			# non-grouped columns are item attributes / the secondary-item BOM link, constant per
+			# grouped (item_code, secondary_item_type) -> Max() keeps the GROUP BY valid on postgres
+			# while returning the value MySQL picked arbitrarily.
+			Max(job_card_secondary_item.item_name).as_("item_name"),
+			Max(job_card_secondary_item.description).as_("description"),
+			Max(job_card_secondary_item.stock_uom).as_("stock_uom"),
 			job_card_secondary_item.secondary_item_type,
-			job_card_secondary_item.bom_secondary_item,
+			Max(job_card_secondary_item.bom_secondary_item).as_("bom_secondary_item"),
 		)
 		.join(job_card_secondary_item)
 		.on(job_card_secondary_item.parent == job_card.name)
@@ -1019,7 +1023,7 @@ def get_secondary_items_from_job_card(work_order, jc_name=None):
 			& (job_card.docstatus == 1)
 		)
 		.groupby(job_card_secondary_item.item_code, job_card_secondary_item.secondary_item_type)
-		.orderby(job_card_secondary_item.idx)
+		.orderby(Min(job_card_secondary_item.idx))
 	)
 
 	if jc_name:
@@ -1037,8 +1041,7 @@ def ceil_qty_if_uom_has_whole_number(qty, stock_uom):
 
 @frappe.whitelist()
 def move_sample_to_retention_warehouse(company: str, items: str | list):
-	if isinstance(items, str):
-		items = json.loads(items)
+	items = frappe.parse_json(items)
 
 	retention_warehouse = frappe.get_single_value("Stock Settings", "sample_retention_warehouse")
 	stock_entry = frappe.new_doc("Stock Entry")

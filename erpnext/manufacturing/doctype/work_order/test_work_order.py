@@ -1048,7 +1048,7 @@ class TestWorkOrder(ERPNextTestSuite):
 		job_cards = frappe.get_all(
 			"Job Card Time Log",
 			fields=["parent as name", "docstatus"],
-			order_by="creation asc",
+			order_by="creation asc",  # pg-ok: dropped under distinct on PG — set is just iterated to cancel, order irrelevant
 			distinct=True,
 		)
 
@@ -5249,11 +5249,8 @@ def update_job_card(job_card, jc_qty=None, days=None):
 
 def get_secondary_item_details(bom_no):
 	secondary_items = {}
-	for item in frappe.db.sql(
-		"""select item_code, stock_qty from `tabBOM Secondary Item`
-		where parent = %s""",
-		bom_no,
-		as_dict=1,
+	for item in frappe.get_all(
+		"BOM Secondary Item", filters={"parent": bom_no}, fields=["item_code", "stock_qty"]
 	):
 		secondary_items[item.item_code] = item.stock_qty
 
