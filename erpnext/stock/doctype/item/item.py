@@ -60,6 +60,7 @@ class Item(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
+		from erpnext.stock.doctype.company_restriction.company_restriction import CompanyRestriction
 		from erpnext.stock.doctype.item_barcode.item_barcode import ItemBarcode
 		from erpnext.stock.doctype.item_customer_detail.item_customer_detail import ItemCustomerDetail
 		from erpnext.stock.doctype.item_default.item_default import ItemDefault
@@ -71,6 +72,7 @@ class Item(Document):
 
 		allow_alternative_item: DF.Check
 		allow_negative_stock: DF.Check
+		allowed_companies: DF.TableMultiSelect[CompanyRestriction]
 		asset_category: DF.Link | None
 		asset_naming_series: DF.Literal[None]
 		attributes: DF.Table[ItemVariantAttribute]
@@ -131,6 +133,7 @@ class Item(Document):
 		quality_inspection_template: DF.Link | None
 		reorder_levels: DF.Table[ItemReorder]
 		retain_sample: DF.Check
+		restrict_to_companies: DF.Check
 		safety_stock: DF.Float
 		sales_tax_withholding_category: DF.Link | None
 		sales_uom: DF.Link | None
@@ -239,6 +242,7 @@ class Item(Document):
 		self.validate_item_defaults()
 		self.validate_auto_reorder_enabled_in_stock_settings()
 		self.cant_change()
+		self.validate_serialized_change_with_bundle()
 		self.validate_standard_cost_change()
 		self.validate_item_tax_net_rate_range()
 
@@ -1130,6 +1134,25 @@ class Item(Document):
 
 			frappe.throw(msg, title=_("Linked with submitted documents"))
 
+	def validate_serialized_change_with_bundle(self):
+		"""Block turning a serialized item non-serialized while any Serial and Batch Bundle still exists
+		for it. Such bundles carry the item's serial numbers; the user must delete or cancel them first."""
+		if self.is_new() or self.has_serial_no or not self._doc_before_save:
+			return
+
+		# Only relevant when the item was serialized before and is now being unset.
+		if not self._doc_before_save.has_serial_no:
+			return
+
+		# Draft (docstatus 0) or submitted (docstatus 1) bundles block the change; cancelled ones don't.
+		if frappe.db.count("Serial and Batch Bundle", {"item_code": self.name, "docstatus": ("<", 2)}):
+			frappe.throw(
+				_(
+					"Cannot change Item {0} from serialized to non-serialized because a Serial and Batch Bundle exists for it. Please delete or cancel the Serial and Batch Bundle first."
+				).format(frappe.bold(self.name)),
+				title=_("Serial and Batch Bundle Exists"),
+			)
+
 	def _get_linked_submitted_documents(self, changed_fields: list[str]) -> dict[str, str] | None:
 		linked_doctypes = [
 			"Delivery Note Item",
@@ -1372,7 +1395,8 @@ def get_purchase_voucher_details(doctype, item_code, document_name=None):
 		query = query.select(parent_doc.transaction_date)
 		query = query.orderby(parent_doc.transaction_date, parent_doc.name, order=Order.desc)
 
-	return query.run(as_dict=1)
+	# only the latest ([0]) row is ever used, so fetch just that instead of every purchase of the item
+	return query.limit(1).run(as_dict=1)
 
 
 def check_stock_uom_with_bin(item, stock_uom):
@@ -1762,3 +1786,13 @@ def get_default_warehouse_for_opening_stock(item, company: str, warehouse: str |
 			"No warehouse found for company {0}. Please set a Default Warehouse in Item Defaults or Stock Settings."
 		).format(frappe.bold(company))
 	)
+
+
+def on_doctype_update():
+	if frappe.db.db_type == "postgres":
+		# The Item link-search (erpnext.controllers.queries.item_query) filters
+		# `item_code/item_name LIKE '%txt%'` -- a leading-wildcard LIKE no btree can serve. pg_trgm
+		# GIN indexes accelerate it. Item is read-heavy/write-light master data, so GIN maintenance
+		# cost is negligible. Postgres-only (`using` is a no-op on MariaDB, which has its own FULLTEXT).
+		frappe.db.add_index("Item", ["item_code"], using="gin_trgm")
+		frappe.db.add_index("Item", ["item_name"], using="gin_trgm")

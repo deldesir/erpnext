@@ -55,9 +55,16 @@ class SupplierScorecard(Document):
 		self.update_standing()
 
 	def on_update(self):
-		score = make_all_scorecards(self.name)
-		if score > 0:
-			self.save()
+		# Guard against recursion: the save() below re-enters on_update().
+		if self.flags.in_rescore:
+			return
+		if make_all_scorecards(self.name) > 0:
+			# New periods were created; re-save to refresh score and standings.
+			self.flags.in_rescore = True
+			try:
+				self.save()
+			finally:
+				self.flags.in_rescore = False
 
 	def validate_standings(self):
 		# Standings must form a continuous chain of bands covering 0 to 100 with no gaps or overlaps
@@ -178,7 +185,7 @@ def refresh_scorecards():
 			frappe.get_doc("Supplier Scorecard", sc_name).save()
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def make_all_scorecards(docname: str):
 	sc = frappe.get_doc("Supplier Scorecard", docname)
 	supplier = frappe.get_doc("Supplier", sc.supplier)
@@ -194,14 +201,16 @@ def make_all_scorecards(docname: str):
 
 	while (start_date < todays) and (end_date <= todays):
 		# check to make sure there is no scorecard period already created
+		# (inclusive bounds: a single-day period — supplier created on a month's
+		# last day — must match its own window, else it is re-created every run)
 		scorecards = frappe.get_all(
 			"Supplier Scorecard Period",
 			fields=["name"],
 			filters={
 				"scorecard": docname,
 				"docstatus": 1,
-				"start_date": ["<", end_date],
-				"end_date": [">", start_date],
+				"start_date": ["<=", end_date],
+				"end_date": [">=", start_date],
 			},
 			order_by="end_date desc",
 		)

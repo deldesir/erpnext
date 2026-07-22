@@ -50,7 +50,7 @@ def get_plaid_configuration():
 	return "disabled"
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_institution(token: str, response: str | dict):
 	response = frappe.parse_json(response)
 
@@ -79,7 +79,7 @@ def add_institution(token: str, response: str | dict):
 	return bank
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_bank_accounts(response: str | dict, bank: str | dict, company: str):
 	response = frappe.parse_json(response)
 	bank = frappe.parse_json(bank)
@@ -215,7 +215,14 @@ def sync_transactions(bank, bank_account):
 		result = []
 		if transactions:
 			for transaction in reversed(transactions):
-				result += new_bank_transaction(transaction)
+				# per-transaction savepoint: a failed insert/submit must not discard the Bank
+				# Transactions already synced this run (MariaDB keeps them) nor poison the txn on Postgres
+				frappe.db.savepoint("plaid_sync_txn")
+				try:
+					result += new_bank_transaction(transaction)
+				except Exception:
+					frappe.db.rollback(save_point="plaid_sync_txn")
+					raise
 
 		if result:
 			last_transaction_date = frappe.db.get_value("Bank Transaction", result.pop(), "date")
