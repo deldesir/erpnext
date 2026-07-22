@@ -1,5 +1,6 @@
 import json
 
+import click
 import frappe
 from frappe import _
 
@@ -152,17 +153,30 @@ def create_customer(customer_data: dict | None = None):
 			for field in CUSTOMER_ALLOWED_FIELDS:
 				if customer_data.get(field) is not None:
 					customer.set(field, customer_data.get(field))
-			customer.insert(ignore_permissions=True)
-			customer_name = customer.name
 
-		contacts = frappe.parse_json(customer_data.get("contacts"))
-		create_contacts(contacts, customer_name, "Customer", customer_name)
-		create_address("Customer", customer_name, customer_data.get("address"))
-		return customer_name
+			# If CRM is installed on the site, User Permission cannot be ignored while saving Customer Records.
+			customer.insert(ignore_permissions=not is_crm_installed())
+			customer_name = customer.name
 	except Exception:
 		frappe.db.rollback()
 		frappe.log_error(frappe.get_traceback(), "Error while creating customer against Frappe CRM Deal")
-		pass
+		return
+
+	# Link contacts/address under a savepoint so a failure here does NOT discard the Customer just
+	# created (a full rollback would; MariaDB kept it pre-migration). Linking is best-effort.
+	frappe.db.savepoint("crm_customer_links")
+	try:
+		contacts = frappe.parse_json(customer_data.get("contacts"))
+		create_contacts(contacts, customer_name, "Customer", customer_name)
+		create_address("Customer", customer_name, customer_data.get("address"))
+	except Exception:
+		frappe.db.rollback(save_point="crm_customer_links")
+		frappe.log_error(frappe.get_traceback(), "Error while linking contacts/address to new Customer")
+		# keep the Customer, but preserve the pre-existing contract of returning None on a linking failure
+		# so CRM callers still see the failure signal
+		return
+
+	return customer_name
 
 
 def validate_frappe_crm_sync():
@@ -171,6 +185,10 @@ def validate_frappe_crm_sync():
 		frappe.throw(
 			_("Frappe CRM data synchronization is not enabled on ERPNext. Contact System Manager of ERPNext.")
 		)
+
+	# Skip allowed_users validation if CRM is installed on the site.
+	if is_crm_installed():
+		return
 
 	allowed_users = [d.user for d in CRMSettings.allowed_users]
 
@@ -181,3 +199,35 @@ def validate_frappe_crm_sync():
 			),
 			exc=frappe.PermissionError,
 		)
+
+
+def is_crm_installed():
+	return "crm" in frappe.get_installed_apps()
+
+
+def remove_allowed_users_on_crm_install():
+	try:
+		CRMSettings = frappe.get_single("CRM Settings")
+
+		if not CRMSettings.enable_frappe_crm_data_synchronization:
+			return
+
+		CRMSettings.allowed_users = []
+		CRMSettings.save()
+		click.secho("Removed 'Allowed Users' from CRM Settings.")
+	except Exception:
+		click.secho("'Allowed Users' from CRM Settings couldn't be cleared.")
+
+
+def disable_frappe_crm_data_synchronization_on_crm_uninstall():
+	try:
+		CRMSettings = frappe.get_single("CRM Settings")
+
+		if not CRMSettings.enable_frappe_crm_data_synchronization:
+			return
+
+		CRMSettings.enable_frappe_crm_data_synchronization = 0
+		CRMSettings.save()
+		click.secho("'Enable Frappe CRM Data Synchronization' on CRM Settings has been disabled.")
+	except Exception:
+		click.secho("'Enable Frappe CRM Data Synchronization' on CRM Settings could not be disabled.")
