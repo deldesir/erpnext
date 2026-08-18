@@ -723,6 +723,76 @@ class TestDeliveryNote(ERPNextTestSuite):
 
 		self.assertEqual(gle_warehouse_amount, 1400)
 
+	def test_return_bundle_voucher_detail_no_as_packed_item(self):
+		"""Return bundle whose voucher_detail_no is the Packed Item (SLE-driven path) must still value on repost."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_sales_return
+
+		warehouse = "_Test Warehouse - _TC"
+		packed_item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "BATCH-DN-RET-VDN-.#####",
+			}
+		).name
+		bundle_item = make_item(properties={"is_stock_item": 0, "is_sales_item": 1}).name
+		make_product_bundle(bundle_item, [packed_item], qty=20)
+
+		make_stock_entry(item_code=packed_item, target=warehouse, qty=60, basic_rate=35)
+
+		dn = create_delivery_note(item_code=bundle_item, warehouse=warehouse, qty=3)
+
+		return_dn = make_sales_return(dn.name)
+		return_dn.items[0].qty = -2
+		return_dn.submit()
+		return_dn.reload()
+
+		packed_row = return_dn.packed_items[0]
+		bundle = frappe.get_doc("Serial and Batch Bundle", packed_row.serial_and_batch_bundle)
+
+		# Reproduce the reported state: bundle points at the Packed Item (not the DN Item), valuation at 0.
+		bundle.db_set("voucher_detail_no", packed_row.name)
+		bundle.db_set({"avg_rate": 0, "total_amount": 0})
+		for entry in bundle.entries:
+			entry.db_set({"incoming_rate": 0, "stock_value_difference": 0})
+		packed_row.db_set("incoming_rate", 0)
+		frappe.db.set_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_type": "Delivery Note",
+				"voucher_no": return_dn.name,
+				"item_code": packed_item,
+				"is_cancelled": 0,
+			},
+			{"incoming_rate": 0, "stock_value_difference": 0},
+		)
+
+		frappe.get_doc(
+			doctype="Repost Item Valuation",
+			based_on="Transaction",
+			voucher_type="Delivery Note",
+			voucher_no=return_dn.name,
+			posting_date=return_dn.posting_date,
+			posting_time=return_dn.posting_time,
+		).submit()
+
+		bundle.reload()
+		self.assertEqual(flt(bundle.avg_rate), 35)
+
+		incoming_rate, stock_value_difference = frappe.db.get_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_type": "Delivery Note",
+				"voucher_no": return_dn.name,
+				"item_code": packed_item,
+				"is_cancelled": 0,
+			},
+			["incoming_rate", "stock_value_difference"],
+		)
+		self.assertEqual(flt(incoming_rate), 35)
+		self.assertEqual(flt(stock_value_difference), 1400)
+
 	def test_bin_details_of_packed_item(self):
 		from erpnext.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
 		from erpnext.stock.doctype.item.test_item import make_item
@@ -1035,6 +1105,129 @@ class TestDeliveryNote(ERPNextTestSuite):
 		self.assertEqual(dn1.status, "Completed")
 
 		self.assertEqual(dn2.get("items")[0].billed_amt, 300)
+		self.assertEqual(dn2.per_billed, 100)
+		self.assertEqual(dn2.status, "Completed")
+
+	def test_dn_billing_falls_back_to_qty_when_amount_is_short(self):
+		# SO -> DN (qty 5 @ 100 => amount 500), invoiced fully but at a lower rate.
+		# The invoiced amount (400) stays below the delivery amount (500), so billing
+		# is measured by quantity and the DN still reaches 100% once fully invoiced.
+		so = make_sales_order(po_no="12345")
+		dn = create_dn_against_so(so.name, delivered_qty=5)
+
+		self.assertEqual(dn.status, "To Bill")
+		self.assertEqual(dn.per_billed, 0)
+
+		# Partial quantity invoiced at a reduced rate -> billed by qty fraction (2 / 5).
+		si1 = make_sales_invoice(dn.name)
+		si1.items[0].qty = 2
+		si1.items[0].rate = 80
+		si1.insert()
+		si1.submit()
+
+		dn.load_from_db()
+		self.assertEqual(dn.items[0].billed_amt, 160)
+		self.assertEqual(dn.per_billed, 40)
+		self.assertEqual(dn.status, "Partially Billed")
+
+		# Remaining quantity invoiced; total invoiced amount (400) is still below the
+		# delivery amount (500), yet all 5 qty are billed -> fully billed.
+		si2 = make_sales_invoice(dn.name)
+		si2.items[0].qty = 3
+		si2.items[0].rate = 80
+		si2.insert()
+		si2.submit()
+
+		dn.load_from_db()
+		self.assertEqual(dn.items[0].billed_amt, 400)
+		self.assertEqual(dn.per_billed, 100)
+		self.assertEqual(dn.status, "Completed")
+
+	def test_dn_qty_billing_ignores_credit_note_that_does_not_update_dn(self):
+		from erpnext.accounts.doctype.sales_invoice.mapper import make_sales_return
+
+		so = make_sales_order(po_no="12345", qty=5)
+		dn = create_dn_against_so(so.name, delivered_qty=5)
+
+		si = make_sales_invoice(dn.name)
+		si.items[0].rate = 80
+		si.insert()
+		si.submit()
+
+		dn.load_from_db()
+		self.assertEqual(dn.per_billed, 100)
+
+		credit_note = make_sales_return(si.name)
+		credit_note.update_billed_amount_in_delivery_note = 0
+		credit_note.items[0].qty = -2
+		credit_note.items[0].stock_qty = -2
+		credit_note.insert()
+		credit_note.submit()
+
+		dn.load_from_db()
+		dn.update_billing_percentage(update_modified=False)
+		dn.load_from_db()
+		self.assertEqual(dn.items[0].billed_amt, 400)
+		self.assertEqual(dn.get_invoiced_qty_map()[dn.items[0].name], 5)
+		self.assertEqual(dn.per_billed, 100)
+
+	def test_dn_billing_falls_back_to_qty_for_so_linked_invoice(self):
+		# SO (qty 5 @ 100) -> two DNs (3 + 2) -> one SI from the SO at a lower rate; the SI
+		# links via so_detail, so invoiced qty is split across the DNs FIFO to 100% each.
+		from erpnext.selling.doctype.sales_order.mapper import make_sales_invoice as make_si_from_so
+
+		so = make_sales_order(po_no="12345", qty=5)
+		dn1 = create_dn_against_so(so.name, delivered_qty=3)
+		dn2 = create_dn_against_so(so.name, delivered_qty=2)
+
+		si = make_si_from_so(so.name)
+		for item in si.items:
+			item.rate = 80
+		si.insert()
+		si.submit()
+
+		dn1.load_from_db()
+		dn2.load_from_db()
+
+		# Amount FIFO: dn1 absorbs 300, dn2 gets the remaining 100 of the 400 billed.
+		self.assertEqual(dn1.items[0].billed_amt, 300)
+		self.assertEqual(dn2.items[0].billed_amt, 100)
+
+		# Qty FIFO: dn1 3/3, dn2 2/2 -> both fully billed despite dn2's short amount.
+		self.assertEqual(dn1.per_billed, 100)
+		self.assertEqual(dn1.status, "Completed")
+		self.assertEqual(dn2.per_billed, 100)
+		self.assertEqual(dn2.status, "Completed")
+
+	def test_so_linked_qty_fifo_is_net_of_returns(self):
+		# SO qty 10 -> DN1 5 (2 returned) + DN2 2 -> SI-from-SO for 5 units. DN1's FIFO
+		# capacity must be its net qty (3), so the 5 invoiced units split 3/2 and both
+		# DNs reach 100%; a gross-qty cap would give DN1 all 5 and leave DN2 at 0%.
+		from erpnext.selling.doctype.sales_order.mapper import make_sales_invoice as make_si_from_so
+		from erpnext.stock.doctype.delivery_note.mapper import make_sales_return
+
+		so = make_sales_order(po_no="12345", qty=10)
+		dn1 = create_dn_against_so(so.name, delivered_qty=5)
+
+		ret = make_sales_return(dn1.name)
+		ret.items[0].qty = -2
+		ret.items[0].stock_qty = -2
+		ret.submit()
+		# nudge the is_return status_updater so DN1's returned_qty is set (auto on submit in prod)
+		frappe.get_doc("Delivery Note", ret.name).update_prevdoc_status()
+
+		dn2 = create_dn_against_so(so.name, delivered_qty=2)
+
+		si = make_si_from_so(so.name)
+		si.items[0].qty = 5
+		si.insert()
+		si.submit()
+
+		dn1.load_from_db()
+		dn2.load_from_db()
+		self.assertEqual(dn1.items[0].returned_qty, 2)
+		self.assertEqual(dn1.per_billed, 100)
+		self.assertEqual(dn1.status, "Completed")
 		self.assertEqual(dn2.per_billed, 100)
 		self.assertEqual(dn2.status, "Completed")
 
@@ -2635,6 +2828,8 @@ class TestDeliveryNote(ERPNextTestSuite):
 
 		returned = frappe.get_doc("Delivery Note", dn_return.name)
 		returned.update_prevdoc_status()
+		dn.load_from_db()
+		dn.update_billing_percentage(update_modified=False)
 		dn.load_from_db()
 		self.assertEqual(dn.per_billed, 100)
 		self.assertEqual(dn.per_returned, 100)

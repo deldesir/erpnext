@@ -164,11 +164,8 @@ class Bin(Document):
 			& (subcontract_order.name == supplied_item.parent)
 			& (subcontract_order.per_received < 100)
 			& (supplied_item.reserve_warehouse == self.warehouse)
-			& (
-				((subcontract_order.status != "Closed") & (subcontract_order.docstatus == 1))
-				if subcontract_doctype == "Purchase Order"
-				else (subcontract_order.docstatus == 1)
-			)
+			& (subcontract_order.status != "Closed")
+			& (subcontract_order.docstatus == 1)
 		)
 
 		reserved_qty_for_sub_contract = (
@@ -203,6 +200,7 @@ class Bin(Document):
 				else (
 					(Coalesce(se.subcontracting_order, "") != "")
 					& (subcontract_order.name == se.subcontracting_order)
+					& (subcontract_order.status != "Closed")
 				)
 			)
 		)
@@ -260,7 +258,13 @@ def get_bin_details(bin_name):
 	)
 
 
-def update_qty(bin_name, args):
+def update_qty_from_sle(bin_name, args):
+	"""Refresh the Bin's quantity fields after an SLE has been processed.
+
+	Distinct from ``stock_balance.update_bin_qty``, which writes caller-supplied
+	absolute values; this recomputes every quantity from the ledger and open
+	documents.
+	"""
 	from erpnext.controllers.stock_controller import future_sle_exists
 
 	bin_details = get_bin_details(bin_name)
