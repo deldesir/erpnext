@@ -18,10 +18,15 @@ erpnext.stock.qi_outgoing_purposes = [
 	"Subcontracting Delivery",
 	"Disassemble",
 ];
+erpnext.stock.secondary_item_purposes = ["Manufacture", "Repack", "Disassemble"];
 erpnext.stock.is_incoming_qi_purpose = (purpose) =>
 	purpose === "Manufacture" || erpnext.stock.qi_incoming_purposes.includes(purpose);
 erpnext.stock.row_requires_quality_inspection = (purpose, row) => {
-	if (row.secondary_item_type || row.is_legacy_scrap_item) return false;
+	if (
+		erpnext.stock.secondary_item_purposes.includes(purpose) &&
+		(row.secondary_item_type || row.is_legacy_scrap_item)
+	)
+		return false;
 	if (purpose === "Manufacture") return !!row.is_finished_item;
 	if (erpnext.stock.qi_incoming_purposes.includes(purpose)) return !!row.t_warehouse;
 	if (erpnext.stock.qi_outgoing_purposes.includes(purpose))
@@ -778,6 +783,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				method: "process_item_selection",
 				args: {
 					item_idx: item.idx,
+					reset_item_details: true,
 				},
 				callback: function (r) {
 					if (!r.exc) {
@@ -1797,7 +1803,10 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		let item = frappe.get_doc(cdt, cdn);
 		item.conversion_factor = 1.0;
 		if (item.stock_qty) {
-			item.conversion_factor = flt(item.stock_qty) / flt(item.qty);
+			item.conversion_factor = flt(
+				flt(item.stock_qty) / flt(item.qty),
+				precision("conversion_factor", item)
+			);
 		}
 
 		refresh_field("conversion_factor", item.name, item.parentfield);
@@ -2864,9 +2873,17 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		}
 	}
 
-	make_mapped_payment_entry(args) {
+	async make_mapped_payment_entry(args) {
 		var me = this;
 		args = args || { dt: this.frm.doc.doctype, dn: this.frm.doc.name };
+		// get_method_for_payment bypasses open_mapped_doc, so run the draft guard explicitly
+		let via_journal_entry = this.frm.doc.__onload && this.frm.doc.__onload.make_payment_via_journal_entry;
+		if (
+			!via_journal_entry &&
+			!(await erpnext.utils.confirm_if_drafts_exist(this.frm.doc, "Payment Entry"))
+		) {
+			return;
+		}
 		return frappe.call({
 			method: me.get_method_for_payment(),
 			args: args,
