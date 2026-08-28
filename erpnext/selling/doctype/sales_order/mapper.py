@@ -307,8 +307,10 @@ def make_delivery_note(
 				return False
 
 		return (
-			(abs(doc.delivered_qty) < abs(doc.qty)) or is_unit_price_row(doc)
-		) and doc.delivered_by_supplier != 1
+			((abs(doc.delivered_qty) < abs(doc.qty)) or is_unit_price_row(doc))
+			and doc.delivered_by_supplier != 1
+			and not cint(doc.skip_delivery)
+		)
 
 	def update_item(source, target, source_parent):
 		target.base_amount = (flt(source.qty) - flt(source.delivered_qty)) * flt(source.base_rate)
@@ -873,6 +875,8 @@ def set_delivery_date(items: list, sales_order: str) -> None:
 @frappe.whitelist(methods=["POST"])
 def make_work_orders(items: str | dict, sales_order: str, company: str, project: str | None = None):
 	"""Make Work Orders against the given Sales Order for the given `items`"""
+	frappe.has_permission("Sales Order", "read", sales_order, throw=True)
+
 	items = frappe.parse_json(items).get("items")
 	out = []
 

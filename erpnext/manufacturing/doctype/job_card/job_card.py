@@ -85,6 +85,7 @@ class JobCard(Document):
 		amended_from: DF.Link | None
 		backflush_from_wip_warehouse: DF.Check
 		barcode: DF.Barcode | None
+		batch_split: DF.Check
 		batch_no: DF.Link | None
 		bom_no: DF.Link | None
 		company: DF.Link
@@ -141,6 +142,7 @@ class JobCard(Document):
 		time_required: DF.Float
 		total_completed_qty: DF.Float
 		total_time_in_mins: DF.Float
+		weight_per_piece: DF.Float
 		track_semi_finished_goods: DF.Check
 		transferred_qty: DF.Float
 		wip_warehouse: DF.Link | None
@@ -259,15 +261,16 @@ class JobCard(Document):
 		return wo_qty + (wo_qty * over_production_percentage / 100)
 
 	def get_total_job_card_qty(self):
-		job_card_qty = frappe.get_all(
-			"Job Card",
-			fields=[{"SUM": "for_quantity"}],
-			filters={
-				"work_order": self.work_order,
-				"operation_id": self.operation_id,
-				"docstatus": ["!=", 2],
-			},
-			as_list=1,
+		job_card = frappe.qb.DocType("Job Card")
+		job_card_qty = (
+			frappe.qb.from_(job_card)
+			.select(Sum(job_card.for_quantity - IfNull(job_card.pending_qty, 0)))
+			.where(
+				(job_card.work_order == self.work_order)
+				& (job_card.operation_id == self.operation_id)
+				& (job_card.docstatus != 2)
+			)
+			.run()
 		)
 		return flt(job_card_qty[0][0]) if job_card_qty else 0
 
