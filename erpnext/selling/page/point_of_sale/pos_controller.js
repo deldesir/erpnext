@@ -152,17 +152,16 @@ erpnext.PointOfSale.Controller = class {
 	async fetch_invoice_fields() {
 		this.settings.invoice_fields = new Array();
 		let pos_settings;
-		try {
+		if ((frappe.boot.single_types || []).includes("POS Settings")) {
 			pos_settings = await frappe.db.get_doc("POS Settings", undefined);
-		} catch (e) {
-			// POS Settings may not be a Single doctype (e.g. when POSNext is installed)
-			// Fall back to fetching the first record from the list
-			const list = await frappe.call({
-				method: "frappe.client.get_list",
-				args: { doctype: "POS Settings", limit_page_length: 1 },
-			});
-			if (list.message && list.message.length) {
-				pos_settings = await frappe.db.get_doc("POS Settings", list.message[0].name);
+		} else {
+			// POS Settings is not a Single here (POS Next ships a DocType of the same name, one
+			// record per POS profile): asking for the single document would 404 and raise the
+			// desk's "not found" dialog before any fallback ran. Read the first record instead;
+			// it carries ERPNext's fields too (invoice_fields, pos_search_fields).
+			const list = await frappe.db.get_list("POS Settings", { fields: ["name"], limit: 1 });
+			if (list.length) {
+				pos_settings = await frappe.db.get_doc("POS Settings", list[0].name);
 			}
 		}
 		if (!pos_settings || !pos_settings.invoice_fields) return;
