@@ -83,7 +83,6 @@ class QualityInspection(Document):
 				for d in parameters:
 					if reading.specification == d.specification:
 						reading.update(d)
-						reading.status = "Accepted"
 
 		if self.readings:
 			self.validate_reading_number_format()
@@ -155,7 +154,12 @@ class QualityInspection(Document):
 			)
 
 	def before_submit(self):
+		self.validate_sample_size()
 		self.validate_readings_status_mandatory()
+
+	def validate_sample_size(self):
+		if flt(self.sample_size) <= 0:
+			frappe.throw(_("Sample Size must be greater than zero"), title=_("Invalid Sample Size"))
 
 	@frappe.whitelist()
 	def get_item_specification_details(self):

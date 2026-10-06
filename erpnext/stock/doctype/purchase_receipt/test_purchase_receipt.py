@@ -25,6 +25,7 @@ from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle impor
 from erpnext.stock.doctype.serial_and_batch_bundle.test_serial_and_batch_bundle import (
 	get_batch_from_bundle,
 	get_serial_nos_from_bundle,
+	get_serial_numbers_from_bundle,
 	make_serial_batch_bundle,
 )
 from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
@@ -1117,13 +1118,286 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		po.reload()
 		po.cancel()
 
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_per_billed_by_qty_when_landed_cost_follows_invoice_rate(self):
+		pr = make_purchase_receipt(qty=100, rate=50)
+		pi = make_purchase_invoice(pr.name)
+		pi.items[0].qty = 25
+		pi.items[0].rate = 200
+		pi.submit()
+
+		pr.reload()
+		self.assertEqual(pr.per_billed, 25)
+		self.assertEqual(pr.status, "Partly Billed")
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_po_invoice_qty_spread_fifo_when_landed_cost_follows_invoice_rate(self):
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+		make_invoice_against_order(po.name, qty=70, rate=40)
+
+		for pr in receipts:
+			pr.reload()
+
+		self.assertEqual(receipts[0].per_billed, 100)
+		self.assertEqual(receipts[1].per_billed, 25)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings",
+		{
+			"maintain_same_rate": 0,
+			"set_landed_cost_based_on_purchase_invoice_rate": 1,
+			"bill_for_rejected_quantity_in_purchase_invoice": 0,
+		},
+	)
+	def test_fully_returned_receipt_skipped_in_po_invoice_split(self):
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+		from erpnext.stock.doctype.purchase_receipt.mapper import make_purchase_return
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+		purchase_return = make_purchase_return(receipts[0].name)
+		purchase_return.set_posting_time = 1
+		purchase_return.posting_time = "12:00"
+		purchase_return.submit()
+		make_invoice_against_order(po.name, qty=40, rate=50)
+
+		for pr in receipts:
+			pr.reload()
+
+		self.assertEqual(receipts[0].per_billed, 0)
+		self.assertEqual(receipts[1].per_billed, 100)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings",
+		{
+			"maintain_same_rate": 0,
+			"set_landed_cost_based_on_purchase_invoice_rate": 1,
+			"bill_for_rejected_quantity_in_purchase_invoice": 0,
+		},
+	)
+	def test_fully_returned_row_left_out_of_qty_billing(self):
+		from erpnext.stock.doctype.purchase_receipt.mapper import make_purchase_return
+
+		pr = make_purchase_receipt(qty=10, rate=50, do_not_save=True)
+		pr.append("items", pr.items[0].as_dict(no_default_fields=True))
+		pr.submit()
+		returned_row, invoiced_row = pr.items
+
+		pr_return = make_purchase_return(pr.name)
+		pr_return.set(
+			"items", [row for row in pr_return.items if row.purchase_receipt_item == returned_row.name]
+		)
+		pr_return.submit()
+
+		pi = make_purchase_invoice(pr.name)
+		pi.set("items", [row for row in pi.items if row.pr_detail == invoiced_row.name])
+		pi.submit()
+
+		pr.reload()
+		self.assertEqual(pr.per_billed, 100)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_zero_rate_receipt_billed_by_qty(self):
+		pr = make_purchase_receipt(item_code="_Test Non Stock Item", qty=10, rate=0)
+		pi = make_purchase_invoice(pr.name)
+		pi.items[0].rate = 5
+		pi.submit()
+
+		pr.reload()
+		self.assertEqual(pr.per_billed, 100)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_non_updating_debit_note_kept_out_of_qty_billing(self):
+		from erpnext.accounts.doctype.purchase_invoice.mapper import make_debit_note
+
+		pr = make_purchase_receipt(qty=100, rate=50)
+		pi = make_purchase_invoice(pr.name)
+		pi.items[0].qty = 50
+		pi.submit()
+
+		debit_note = make_debit_note(pi.name)
+		debit_note.items[0].qty = -20
+		debit_note.update_billed_amount_in_purchase_receipt = 0
+		debit_note.submit()
+
+		pi = make_purchase_invoice(pr.name)
+		pi.items[0].qty = 50
+		pi.submit()
+
+		pr.reload()
+		self.assertEqual(pr.per_billed, 100)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_landed_cost_takes_order_invoices_oldest_first(self):
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+
+		make_invoice_against_order(po.name, qty=60, rate=70)
+		self.assertEqual(get_amount_differences(receipts), [1200, 0])
+
+		make_invoice_against_order(po.name, qty=40, rate=55)
+		self.assertEqual(get_amount_differences(receipts), [1200, 200])
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings",
+		{
+			"maintain_same_rate": 0,
+			"set_landed_cost_based_on_purchase_invoice_rate": 1,
+			"allow_multiple_items": 1,
+		},
+	)
+	def test_landed_cost_takes_invoice_rows_in_order(self):
+		from erpnext.buying.doctype.purchase_order.mapper import (
+			make_purchase_invoice as make_purchase_invoice_from_po,
+		)
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+
+		pi = make_purchase_invoice_from_po(po.name)
+		pi.append("items", pi.items[0].as_dict(no_default_fields=True))
+		pi.items[0].qty = 60
+		pi.items[0].rate = 70
+		pi.items[1].qty = 40
+		pi.items[1].rate = 55
+		pi.submit()
+
+		self.assertEqual(get_amount_differences(receipts), [1200, 200])
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_non_updating_order_debit_note_kept_out_of_invoice_split(self):
+		from erpnext.accounts.doctype.purchase_invoice.mapper import make_debit_note
+		from erpnext.buying.doctype.purchase_order.mapper import (
+			make_purchase_invoice as make_purchase_invoice_from_po,
+		)
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+		from erpnext.stock.doctype.purchase_receipt.services.billing_status import update_billing_percentage
+
+		po = create_purchase_order(qty=100, rate=50)
+		(pr,) = make_receipts_against_order(po.name, ((100, "08:00"),))
+		pi = make_purchase_invoice_from_po(po.name)
+		pi.submit()
+
+		debit_note = make_debit_note(pi.name)
+		debit_note.items[0].qty = -20
+		debit_note.update_billed_amount_in_purchase_receipt = 0
+		debit_note.submit()
+
+		update_billing_percentage(frappe.get_doc("Purchase Receipt", pr.name))
+		pr.reload()
+		self.assertEqual(pr.per_billed, 100)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_unlinked_order_debit_note_takes_back_newest_invoice_qty(self):
+		from erpnext.buying.doctype.purchase_order.mapper import (
+			make_purchase_invoice as make_purchase_invoice_from_po,
+		)
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+		pi = make_purchase_invoice_from_po(po.name)
+		pi.submit()
+
+		debit_note = frappe.copy_doc(pi)
+		debit_note.is_return = 1
+		debit_note.items[0].qty = -40
+		debit_note.submit()
+
+		for pr in receipts:
+			pr.reload()
+
+		self.assertEqual([pr.per_billed for pr in receipts], [100, 0])
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_unlinked_order_debit_note_takes_back_its_own_value(self):
+		from erpnext.buying.doctype.purchase_order.mapper import (
+			make_purchase_invoice as make_purchase_invoice_from_po,
+		)
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((100, "08:00"),))
+		pi = make_purchase_invoice_from_po(po.name)
+		pi.submit()
+
+		debit_note = frappe.copy_doc(pi)
+		debit_note.is_return = 1
+		debit_note.items[0].qty = -20
+		debit_note.items[0].rate = 60
+		debit_note.submit()
+
+		self.assertEqual(get_amount_differences(receipts), [-250])
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_landed_cost_refreshed_on_receipt_whose_share_moved(self):
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+
+		pi = make_purchase_invoice(receipts[0].name)
+		pi.items[0].qty = 1
+		pi.submit()
+		make_invoice_against_order(po.name, qty=69, rate=40)
+
+		second_row = receipts[1].items[0].name
+		self.assertEqual(frappe.db.get_value("Purchase Receipt Item", second_row, "billed_amt"), 0)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Purchase Receipt Item", second_row, "amount_difference_with_purchase_invoice"
+			),
+			-400,
+		)
+
+	@ERPNextTestSuite.change_settings(
+		"Buying Settings", {"maintain_same_rate": 0, "set_landed_cost_based_on_purchase_invoice_rate": 1}
+	)
+	def test_invoice_refresh_leaves_unchanged_receipt_alone(self):
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
+
+		po = create_purchase_order(qty=100, rate=50)
+		receipts = make_receipts_against_order(po.name, ((60, "08:00"), (40, "10:00")))
+		untouched_modified = frappe.db.get_value("Purchase Receipt", receipts[1].name, "modified")
+
+		make_invoice_against_order(po.name, qty=60, rate=50)
+
+		self.assertEqual(frappe.db.get_value("Purchase Receipt", receipts[0].name, "per_billed"), 100)
+		self.assertEqual(
+			frappe.db.get_value("Purchase Receipt", receipts[1].name, "modified"), untouched_modified
+		)
+
 	def test_serial_no_against_purchase_receipt(self):
 		item_code = "Test Manual Created Serial No"
 		if not frappe.db.exists("Item", item_code):
 			make_item(item_code, dict(has_serial_no=1))
 
 		serial_no = ["12903812901"]
-		if not frappe.db.exists("Serial No", serial_no[0]):
+		if not frappe.db.exists("Serial No", {"item_code": item_code, "serial_no": serial_no[0]}):
 			frappe.get_doc(
 				{
 					"doctype": "Serial No",
@@ -1133,11 +1407,13 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 				}
 			).insert()
 
-		pr_doc = make_purchase_receipt(item_code=item_code, qty=1, serial_no=serial_no)
+		pr_doc = make_purchase_receipt(
+			item_code=item_code, qty=1, serial_no="\n".join(serial_no), use_serial_batch_fields=1
+		)
 		pr_doc.load_from_db()
 
 		bundle_id = pr_doc.items[0].serial_and_batch_bundle
-		self.assertEqual(serial_no[0], get_serial_nos_from_bundle(bundle_id)[0])
+		self.assertEqual(serial_no[0], get_serial_numbers_from_bundle(bundle_id)[0])
 
 		voucher_no = frappe.db.get_value("Serial and Batch Bundle", bundle_id, "voucher_no")
 
@@ -1153,7 +1429,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		new_pr_doc.load_from_db()
 
 		bundle_id = new_pr_doc.items[0].serial_and_batch_bundle
-		serial_no = get_serial_nos_from_bundle(bundle_id)[0]
+		serial_no = get_serial_numbers_from_bundle(bundle_id)[0]
 		self.assertTrue(serial_no)
 
 		voucher_no = frappe.db.get_value("Serial and Batch Bundle", bundle_id, "voucher_no")
@@ -2258,6 +2534,1096 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 
 		self.assertEqual(query[0].value, 0)
 
+	def test_internal_transfer_pr_rejected_qty_leaves_in_transit_warehouse(self):
+		"""Rejected material of an internal transfer leaves the in-transit warehouse along with the
+		accepted material, and is booked into the rejected warehouse, whatever Buying Settings says
+		about valuing rejected material."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		self.addCleanup(
+			frappe.db.set_single_value,
+			"Buying Settings",
+			"set_valuation_rate_for_rejected_materials",
+			frappe.db.get_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials"),
+		)
+		frappe.db.set_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials", 0)
+
+		prepare_data_for_internal_transfer()
+		customer = "_Test Internal Customer 2"
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Rejected Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Rejected Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Rejected Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test Rejected Transfer Rejected", company=company)
+
+		item_doc = create_item("Test Rejected Internal Transfer Item")
+
+		make_purchase_receipt(
+			item_code=item_doc.name,
+			company=company,
+			warehouse=from_warehouse,
+			qty=10,
+			rate=100,
+		)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer=customer,
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 7
+		pr.items[0].rejected_qty = 3
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.submit()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_type": "Purchase Receipt", "voucher_no": pr.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "stock_value_difference"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		stock_value = {d.warehouse: d.stock_value_difference for d in sl_entries}
+
+		self.assertEqual(stock_qty[transit_warehouse], -10)
+		self.assertEqual(stock_qty[to_warehouse], 7)
+		self.assertEqual(stock_qty[rejected_warehouse], 3)
+
+		self.assertEqual(stock_value[transit_warehouse], -1000)
+		self.assertEqual(stock_value[to_warehouse], 700)
+		self.assertEqual(stock_value[rejected_warehouse], 300)
+
+		gl_entries = get_gl_entries("Purchase Receipt", pr.name, skip_cancelled=True)
+		booked_value = {d.account: flt(d.debit) - flt(d.credit) for d in gl_entries}
+
+		self.assertEqual(sum(booked_value.values()), 0)
+		self.assertEqual(booked_value[get_inventory_account(company, transit_warehouse)], -1000)
+		self.assertEqual(booked_value[get_inventory_account(company, to_warehouse)], 700)
+		self.assertEqual(booked_value[get_inventory_account(company, rejected_warehouse)], 300)
+
+	def test_internal_transfer_rejected_qty_for_serial_item(self):
+		"""Rejected serial numbers leave the in-transit warehouse and stay out of the package of
+		accepted material."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		customer = "_Test Internal Customer 2"
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Serial Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Serial Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Serial Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test Serial Transfer Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Serial Item For Rejected Transfer",
+			{"has_serial_no": 1, "serial_no_series": "SN-SIFRT-.####"},
+		)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+		serial_nos = get_serial_nos_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer=customer,
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			serial_no=serial_nos,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 7
+		pr.items[0].rejected_qty = 3
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.items[0].rejected_serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": rejected_warehouse,
+					"qty": 3,
+					"serial_nos": serial_nos[7:],
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Inward",
+					"is_rejected": 1,
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.save()
+		pr.submit()
+		pr.reload()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_type": "Purchase Receipt", "voucher_no": pr.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "serial_and_batch_bundle"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		self.assertEqual(stock_qty[transit_warehouse], -10)
+		self.assertEqual(stock_qty[to_warehouse], 7)
+		self.assertEqual(stock_qty[rejected_warehouse], 3)
+
+		package = {d.warehouse: d.serial_and_batch_bundle for d in sl_entries}
+		self.assertEqual(sorted(get_serial_nos_from_bundle(package[transit_warehouse])), sorted(serial_nos))
+		self.assertEqual(sorted(get_serial_nos_from_bundle(package[to_warehouse])), sorted(serial_nos[:7]))
+		self.assertEqual(
+			sorted(get_serial_nos_from_bundle(package[rejected_warehouse])), sorted(serial_nos[7:])
+		)
+
+		pr.cancel()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Bin", {"warehouse": transit_warehouse, "item_code": item_doc.name}, "actual_qty"
+			),
+			10,
+		)
+		self.assertEqual(
+			frappe.get_all(
+				"Serial No",
+				filters={"name": ("in", serial_nos), "warehouse": transit_warehouse},
+				pluck="name",
+				order_by="name",
+			),
+			sorted(serial_nos),
+		)
+
+	def test_internal_transfer_rejected_serial_numbers_typed_in_the_serial_field(self):
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+		from_warehouse = create_warehouse("_Test Typed Serial Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Typed Serial Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Typed Serial Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test Typed Serial Transfer Rejected", company=company)
+		item_code = make_item(
+			"_Test Typed Serial Item For Rejected Transfer",
+			{"has_serial_no": 1, "serial_no_series": "SN-TSIFRT-.####"},
+		).name
+
+		receipt = make_purchase_receipt(
+			item_code=item_code, company=company, warehouse=from_warehouse, qty=4, rate=100
+		)
+		serial_nos = get_serial_nos_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		rejected_numbers = []
+		for serial_no in serial_nos[3:]:
+			frappe.db.set_value("Serial No", serial_no, "serial_no", f"{serial_no}-Typed")
+			rejected_numbers.append(f"{serial_no}-Typed")
+
+		dn = create_delivery_note(
+			item_code=item_code,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=4,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			serial_no=serial_nos,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].update(
+			{
+				"warehouse": to_warehouse,
+				"qty": 3,
+				"rejected_qty": 1,
+				"received_qty": 4,
+				"rejected_warehouse": rejected_warehouse,
+				"use_serial_batch_fields": 1,
+				"rejected_serial_no": "\n".join(rejected_numbers),
+			}
+		)
+		pr.save()
+
+		self.assertCountEqual(get_serial_nos_from_bundle(pr.items[0].serial_and_batch_bundle), serial_nos[:3])
+
+	def test_internal_transfer_rejected_qty_for_batch_item(self):
+		"""A batch item rejected on an internal transfer leaves the in-transit warehouse with the
+		accepted material, and the outgoing package holds both."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		customer = "_Test Internal Customer 2"
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Batch Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Batch Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Batch Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test Batch Transfer Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Batch Item For Rejected Transfer",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIFRT-.####"},
+		)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer=customer,
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			batch_no=batch_no,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 7
+		pr.items[0].rejected_qty = 3
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.items[0].rejected_serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": rejected_warehouse,
+					"qty": 3,
+					"batches": frappe._dict({batch_no: 3}),
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Inward",
+					"is_rejected": 1,
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.save()
+		pr.submit()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_type": "Purchase Receipt", "voucher_no": pr.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "serial_and_batch_bundle"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		self.assertEqual(stock_qty[transit_warehouse], -10)
+		self.assertEqual(stock_qty[to_warehouse], 7)
+		self.assertEqual(stock_qty[rejected_warehouse], 3)
+
+		package = {d.warehouse: d.serial_and_batch_bundle for d in sl_entries}
+		self.assertEqual(
+			frappe.db.get_value("Serial and Batch Bundle", package[transit_warehouse], "total_qty"), -10
+		)
+
+		booked_value = {
+			d.account: flt(d.debit) - flt(d.credit)
+			for d in get_gl_entries("Purchase Receipt", pr.name, skip_cancelled=True)
+		}
+		self.assertEqual(sum(booked_value.values()), 0)
+		self.assertEqual(booked_value[get_inventory_account(company, transit_warehouse)], -1000)
+		self.assertEqual(booked_value[get_inventory_account(company, to_warehouse)], 700)
+		self.assertEqual(booked_value[get_inventory_account(company, rejected_warehouse)], 300)
+
+		pr.cancel()
+		self.assertEqual(
+			frappe.db.get_value(
+				"Bin", {"warehouse": transit_warehouse, "item_code": item_doc.name}, "actual_qty"
+			),
+			10,
+		)
+
+	def test_internal_transfer_of_batch_item_bought_in_another_uom(self):
+		"""The package of the in-transit warehouse is sized in stock UOM, which is what the row is
+		validated against."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Box Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Box Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Box Transfer To", company=company)
+
+		item_doc = make_item(
+			"_Test Box Batch Item For Transfer",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BOXT-.####"},
+		)
+		make_uom_conversion_factor("Box", "Nos", 12)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=12, rate=100
+		)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=12,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			batch_no=batch_no,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].uom = "Box"
+		pr.items[0].conversion_factor = 12
+		pr.items[0].qty = 1
+		pr.items[0].received_qty = 1
+		pr.submit()
+
+		self.assertEqual(pr.items[0].stock_qty, 12)
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_type": "Purchase Receipt", "voucher_no": pr.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		self.assertEqual(stock_qty[transit_warehouse], -12)
+		self.assertEqual(stock_qty[to_warehouse], 12)
+
+	def test_rejected_package_of_a_transfer_bought_in_another_uom(self):
+		"""The package of rejected material is sized in stock UOM, like every other package."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Box Reject From", company=company)
+		transit_warehouse = create_warehouse("_Test Box Reject Transit", company=company)
+		to_warehouse = create_warehouse("_Test Box Reject To", company=company)
+		rejected_warehouse = create_warehouse("_Test Box Reject Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Box Batch Item For Rejection",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BOXR-.####"},
+		)
+		make_uom_conversion_factor("Box", "Nos", 12)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=24, rate=100
+		)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=24,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			batch_no=batch_no,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.items[0].uom = "Box"
+		pr.items[0].conversion_factor = 12
+		pr.items[0].qty = 1
+		pr.items[0].rejected_qty = 1
+		pr.items[0].received_qty = 2
+		pr.submit()
+		pr.reload()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Serial and Batch Bundle", pr.items[0].rejected_serial_and_batch_bundle, "total_qty"
+			),
+			12,
+		)
+
+		moved_qty = {
+			d.warehouse: d.actual_qty
+			for d in frappe.get_all(
+				"Stock Ledger Entry",
+				filters={"voucher_no": pr.name, "is_cancelled": 0},
+				fields=["warehouse", "actual_qty"],
+			)
+		}
+		self.assertEqual(moved_qty[transit_warehouse], -24)
+		self.assertEqual(moved_qty[to_warehouse], 12)
+		self.assertEqual(moved_qty[rejected_warehouse], 12)
+
+	def test_landed_cost_voucher_on_a_receipt_with_rejected_batch_material(self):
+		"""A landed cost voucher rebuilds the entries of the receipt; the package of the in-transit
+		warehouse has to be reused, or the batch is counted twice."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+		from erpnext.stock.doctype.landed_cost_voucher.test_landed_cost_voucher import (
+			create_landed_cost_voucher,
+		)
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test LCV Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test LCV Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test LCV Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test LCV Transfer Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Batch Item For LCV Transfer",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIFLT-.####"},
+		)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			batch_no=batch_no,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 7
+		pr.items[0].rejected_qty = 3
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.items[0].rejected_serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": rejected_warehouse,
+					"qty": 3,
+					"batches": frappe._dict({batch_no: 3}),
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Inward",
+					"is_rejected": 1,
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.save()
+		pr.submit()
+
+		create_landed_cost_voucher("Purchase Receipt", pr.name, pr.company, charges=120)
+
+		self.assertEqual(frappe.db.get_value("Batch", batch_no, "batch_qty"), 10)
+
+		packages = frappe.get_all(
+			"Serial and Batch Bundle",
+			filters={
+				"voucher_no": pr.name,
+				"warehouse": transit_warehouse,
+				"docstatus": 1,
+				"is_cancelled": 0,
+			},
+			pluck="total_qty",
+		)
+
+		self.assertEqual(packages, [-10])
+
+	def test_landed_cost_voucher_leaves_the_rejected_material_of_a_transfer_alone(self):
+		"""A charge is spread over the material the receipt accepted; what was rejected keeps the
+		value it arrived in transit with."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+		from erpnext.stock.doctype.landed_cost_voucher.test_landed_cost_voucher import (
+			create_landed_cost_voucher,
+		)
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Charge Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Charge Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Charge Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test Charge Transfer Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Batch Item For Charged Transfer",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIFCT-.####"},
+		)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			batch_no=batch_no,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 7
+		pr.items[0].rejected_qty = 3
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.submit()
+
+		create_landed_cost_voucher("Purchase Receipt", pr.name, pr.company, charges=120)
+
+		moved_value = {
+			d.warehouse: flt(d.stock_value_difference)
+			for d in frappe.get_all(
+				"Stock Ledger Entry",
+				filters={"voucher_no": pr.name, "is_cancelled": 0},
+				fields=["warehouse", "stock_value_difference"],
+			)
+		}
+
+		self.assertEqual(moved_value[transit_warehouse], -1000)
+		self.assertEqual(moved_value[to_warehouse], 784)
+		self.assertEqual(moved_value[rejected_warehouse], 300)
+
+		booked = {}
+		for entry in frappe.get_all(
+			"GL Entry",
+			filters={"voucher_no": pr.name, "is_cancelled": 0},
+			fields=["account", "debit", "credit"],
+		):
+			booked.setdefault(entry.account, 0)
+			booked[entry.account] += flt(entry.debit) - flt(entry.credit)
+
+		self.assertEqual(flt(sum(booked.values()), 2), 0)
+
+	def test_return_of_a_fully_rejected_receipt(self):
+		"""A receipt that rejected every unit can be sent back."""
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+
+		company = "_Test Company with perpetual inventory"
+		rejected_warehouse = create_warehouse("_Test Fully Rejected Return", company=company)
+		item = make_item("_Test Item For A Fully Rejected Receipt").name
+
+		pr = make_purchase_receipt(
+			company=company,
+			item_code=item,
+			warehouse="Stores - TCP1",
+			qty=0,
+			rejected_qty=10,
+			received_qty=10,
+			rate=100,
+			rejected_warehouse=rejected_warehouse,
+			do_not_save=True,
+		)
+		pr.submit()
+
+		returned = make_return_doc("Purchase Receipt", pr.name)
+		returned.submit()
+
+		self.assertEqual(returned.items[0].qty, 0)
+		self.assertEqual(returned.items[0].rejected_qty, -10)
+
+		moved_qty = {
+			d.warehouse: d.actual_qty
+			for d in frappe.get_all(
+				"Stock Ledger Entry",
+				filters={"voucher_no": returned.name, "is_cancelled": 0},
+				fields=["warehouse", "actual_qty"],
+			)
+		}
+		self.assertEqual(moved_qty, {rejected_warehouse: -10})
+
+	def test_return_of_a_transfer_that_rejected_batch_material(self):
+		"""Returning the whole receipt puts the accepted and the rejected material back into the
+		in-transit warehouse, and leaves the batch qty where it started."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+		from erpnext.stock.doctype.purchase_receipt.mapper import make_purchase_return
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Return Transfer From", company=company)
+		transit_warehouse = create_warehouse("_Test Return Transfer Transit", company=company)
+		to_warehouse = create_warehouse("_Test Return Transfer To", company=company)
+		rejected_warehouse = create_warehouse("_Test Return Transfer Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Batch Item For Returned Transfer",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIFRET-.####"},
+		)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			batch_no=batch_no,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 7
+		pr.items[0].rejected_qty = 3
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.items[0].rejected_serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": rejected_warehouse,
+					"qty": 3,
+					"batches": frappe._dict({batch_no: 3}),
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Inward",
+					"is_rejected": 1,
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.save()
+		pr.submit()
+
+		self.assertEqual(frappe.db.get_value("Batch", batch_no, "batch_qty"), 10)
+
+		pr_return = make_purchase_return(pr.name)
+		pr_return.save()
+		pr_return.submit()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_no": pr_return.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "serial_and_batch_bundle"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		self.assertEqual(stock_qty[transit_warehouse], 10)
+		self.assertEqual(stock_qty[to_warehouse], -7)
+		self.assertEqual(stock_qty[rejected_warehouse], -3)
+
+		package = {d.warehouse: d.serial_and_batch_bundle for d in sl_entries}
+		self.assertEqual(
+			frappe.db.get_value("Serial and Batch Bundle", package[transit_warehouse], "total_qty"), 10
+		)
+
+		self.assertEqual(frappe.db.get_value("Batch", batch_no, "batch_qty"), 10)
+
+	def test_rejecting_serial_numbers_after_the_package_was_built(self):
+		"""Rejecting material after the row already has a package tops that package up, so it still
+		covers everything that left the in-transit warehouse."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Top Up From", company=company)
+		transit_warehouse = create_warehouse("_Test Top Up Transit", company=company)
+		to_warehouse = create_warehouse("_Test Top Up To", company=company)
+		rejected_warehouse = create_warehouse("_Test Top Up Rejected", company=company)
+
+		item_doc = make_item(
+			"_Test Serial Item For Topped Up Package",
+			{"has_serial_no": 1, "serial_no_series": "SN-SIFTUP-.####"},
+		)
+
+		receipt = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+		serial_nos = get_serial_nos_from_bundle(receipt.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+			serial_no=serial_nos,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 4
+		pr.items[0].rejected_qty = 6
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+
+		# the desk fills the package of the row with the accepted serial numbers alone
+		pr.items[0].serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": transit_warehouse,
+					"qty": -4,
+					"serial_nos": serial_nos[:4],
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Outward",
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.items[0].rejected_serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": rejected_warehouse,
+					"qty": 6,
+					"serial_nos": serial_nos[4:],
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Inward",
+					"is_rejected": 1,
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.save()
+		pr.submit()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_type": "Purchase Receipt", "voucher_no": pr.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "serial_and_batch_bundle"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		self.assertEqual(stock_qty[transit_warehouse], -10)
+		self.assertEqual(stock_qty[to_warehouse], 4)
+		self.assertEqual(stock_qty[rejected_warehouse], 6)
+
+		package = {d.warehouse: d.serial_and_batch_bundle for d in sl_entries}
+		self.assertEqual(sorted(get_serial_nos_from_bundle(package[transit_warehouse])), sorted(serial_nos))
+		self.assertEqual(sorted(get_serial_nos_from_bundle(package[to_warehouse])), sorted(serial_nos[:4]))
+
+	def test_internal_transfer_with_every_unit_rejected(self):
+		"""A receipt that rejects everything still empties the in-transit warehouse, and its entry
+		balances."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		customer = "_Test Internal Customer 2"
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test All Rejected From", company=company)
+		transit_warehouse = create_warehouse("_Test All Rejected Transit", company=company)
+		to_warehouse = create_warehouse("_Test All Rejected To", company=company)
+		rejected_warehouse = create_warehouse("_Test All Rejected Rejected", company=company)
+
+		item_doc = create_item("Test All Rejected Internal Transfer Item")
+
+		make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer=customer,
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 0
+		pr.items[0].rejected_qty = 10
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.submit()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_type": "Purchase Receipt", "voucher_no": pr.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "stock_value_difference"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		self.assertEqual(stock_qty[transit_warehouse], -10)
+		self.assertEqual(stock_qty[rejected_warehouse], 10)
+		self.assertNotIn(to_warehouse, stock_qty)
+
+		stock_value = {d.warehouse: d.stock_value_difference for d in sl_entries}
+		self.assertEqual(stock_value[transit_warehouse], -1000)
+		self.assertEqual(stock_value[rejected_warehouse], 1000)
+
+		gl_entries = get_gl_entries("Purchase Receipt", pr.name, skip_cancelled=True)
+		booked_value = {d.account: flt(d.debit) - flt(d.credit) for d in gl_entries}
+
+		self.assertEqual(sum(booked_value.values()), 0)
+		self.assertEqual(booked_value[get_inventory_account(company, transit_warehouse)], -1000)
+		self.assertEqual(booked_value[get_inventory_account(company, rejected_warehouse)], 1000)
+
+	def test_return_from_the_rejected_warehouse_of_an_internal_transfer(self):
+		"""Returning rejected material of an internal transfer puts its value back into the
+		in-transit warehouse instead of writing it off."""
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+
+		from_warehouse = create_warehouse("_Test Rejected Return From", company=company)
+		transit_warehouse = create_warehouse("_Test Rejected Return Transit", company=company)
+		to_warehouse = create_warehouse("_Test Rejected Return To", company=company)
+		rejected_warehouse = create_warehouse("_Test Rejected Return Rejected", company=company)
+
+		item_doc = create_item("Test Rejected Return Internal Transfer Item")
+
+		make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=from_warehouse, qty=10, rate=100
+		)
+
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=100,
+			warehouse=from_warehouse,
+			target_warehouse=transit_warehouse,
+		)
+
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = to_warehouse
+		pr.items[0].qty = 0
+		pr.items[0].rejected_qty = 10
+		pr.items[0].received_qty = 10
+		pr.items[0].rejected_warehouse = rejected_warehouse
+		pr.submit()
+
+		pr_return = make_return_doc("Purchase Receipt", pr.name, return_against_rejected_qty=True)
+		pr_return.save()
+		pr_return.submit()
+
+		sl_entries = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"voucher_no": pr_return.name, "is_cancelled": 0},
+			fields=["warehouse", "actual_qty", "stock_value_difference"],
+		)
+
+		stock_qty = {d.warehouse: d.actual_qty for d in sl_entries}
+		stock_value = {d.warehouse: d.stock_value_difference for d in sl_entries}
+
+		self.assertEqual(stock_qty[transit_warehouse], 10)
+		self.assertEqual(stock_qty[rejected_warehouse], -10)
+		self.assertEqual(stock_value[transit_warehouse], 1000)
+		self.assertEqual(stock_value[rejected_warehouse], -1000)
+
+		booked_value = {
+			d.account: flt(d.debit) - flt(d.credit)
+			for d in get_gl_entries("Purchase Receipt", pr_return.name, skip_cancelled=True)
+		}
+
+		self.assertEqual(sum(booked_value.values()), 0)
+		self.assertEqual(booked_value[get_inventory_account(company, transit_warehouse)], 1000)
+		self.assertEqual(booked_value[get_inventory_account(company, rejected_warehouse)], -1000)
+
+	def make_transfer_receipt(self, tag, item_doc, qty, rejected):
+		from erpnext.stock.doctype.delivery_note.mapper import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		prepare_data_for_internal_transfer()
+		company = "_Test Company with perpetual inventory"
+		wh = frappe._dict(
+			source=create_warehouse(f"_Test {tag} Transfer From", company=company),
+			transit=create_warehouse(f"_Test {tag} Transfer Transit", company=company),
+			accepted=create_warehouse(f"_Test {tag} Transfer To", company=company),
+			rejected=create_warehouse(f"_Test {tag} Transfer Rejected", company=company),
+		)
+		seed = make_purchase_receipt(
+			item_code=item_doc.name, company=company, warehouse=wh.source, qty=qty + rejected, rate=100
+		)
+		batch_no = (
+			get_batch_from_bundle(seed.items[0].serial_and_batch_bundle) if item_doc.has_batch_no else None
+		)
+		dn = create_delivery_note(
+			item_code=item_doc.name,
+			company=company,
+			customer="_Test Internal Customer 2",
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=qty + rejected,
+			rate=100,
+			warehouse=wh.source,
+			target_warehouse=wh.transit,
+			batch_no=batch_no,
+		)
+		pr = make_inter_company_purchase_receipt(dn.name)
+		pr.items[0].warehouse = wh.accepted
+		pr.items[0].qty = qty
+		pr.items[0].rejected_qty = rejected
+		pr.items[0].received_qty = qty + rejected
+		pr.items[0].rejected_warehouse = wh.rejected
+		return pr, wh, company, batch_no
+
+	def test_removing_the_rejection_moves_the_package_back(self):
+		"""A row that no longer rejects anything carries the package of the in-transit warehouse
+		again, which is the entry it belongs to."""
+		item_doc = make_item(
+			"_Test Batch Item For Removed Rejection",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIFRR-.####"},
+		)
+
+		pr, warehouses, company, batch_no = self.make_transfer_receipt("Removed", item_doc, 7, 3)
+		pr.items[0].rejected_serial_and_batch_bundle = make_serial_batch_bundle(
+			frappe._dict(
+				{
+					"item_code": item_doc.name,
+					"warehouse": warehouses.rejected,
+					"qty": 3,
+					"batches": frappe._dict({batch_no: 3}),
+					"voucher_type": "Purchase Receipt",
+					"type_of_transaction": "Inward",
+					"is_rejected": 1,
+					"do_not_submit": True,
+					"posting_date": pr.posting_date,
+					"posting_time": pr.posting_time,
+				}
+			)
+		).name
+		pr.save()
+
+		self.assertEqual(
+			frappe.db.get_value("Serial and Batch Bundle", pr.items[0].serial_and_batch_bundle, "warehouse"),
+			warehouses.accepted,
+		)
+
+		pr.items[0].qty = 10
+		pr.items[0].rejected_qty = 0
+		pr.items[0].rejected_serial_and_batch_bundle = None
+		pr.items[0].received_qty = 10
+		pr.save()
+
+		self.assertEqual(
+			frappe.db.get_value("Serial and Batch Bundle", pr.items[0].serial_and_batch_bundle, "warehouse"),
+			warehouses.transit,
+		)
+
+		pr.submit()
+
+		stock_qty = {
+			d.warehouse: d.actual_qty
+			for d in frappe.get_all(
+				"Stock Ledger Entry",
+				filters={"voucher_no": pr.name, "is_cancelled": 0},
+				fields=["warehouse", "actual_qty"],
+			)
+		}
+
+		self.assertEqual(stock_qty[warehouses.transit], -10)
+		self.assertEqual(stock_qty[warehouses.accepted], 10)
+
+	def test_rejected_package_is_built_for_a_transfer_that_rejects_batch_material(self):
+		"""A receipt of an internal transfer builds no package for rejected material on its own, so
+		the row gets one from the material that was delivered into the in-transit warehouse."""
+		item_doc = make_item(
+			"_Test Batch Item For Built Rejection",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIFBR-.####"},
+		)
+
+		pr, warehouses, company, batch_no = self.make_transfer_receipt("Built", item_doc, 7, 3)
+		pr.save()
+
+		self.assertTrue(pr.items[0].rejected_serial_and_batch_bundle)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Serial and Batch Bundle",
+				pr.items[0].rejected_serial_and_batch_bundle,
+				["warehouse", "total_qty", "is_rejected"],
+				as_dict=True,
+			),
+			frappe._dict({"warehouse": warehouses.rejected, "total_qty": 3, "is_rejected": 1}),
+		)
+
+		pr.submit()
+
+		stock_qty = {
+			d.warehouse: d.actual_qty
+			for d in frappe.get_all(
+				"Stock Ledger Entry",
+				filters={"voucher_no": pr.name, "is_cancelled": 0},
+				fields=["warehouse", "actual_qty"],
+			)
+		}
+
+		self.assertEqual(stock_qty[warehouses.transit], -10)
+		self.assertEqual(stock_qty[warehouses.accepted], 7)
+		self.assertEqual(stock_qty[warehouses.rejected], 3)
+		self.assertEqual(frappe.db.get_value("Batch", batch_no, "batch_qty"), 10)
+
 	def test_internal_transfer_pr_incoming_sle_anchored_to_dn_rate(self):
 		"""Internal-transfer PR's inward SLE must use DN.incoming_rate even when
 		PR.item.valuation_rate was wrong at submit, so divisional_loss does not
@@ -3198,7 +4564,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		sbb_doc = frappe.get_doc("Serial and Batch Bundle", pr.items[0].serial_and_batch_bundle)
 
 		for row in sbb_doc.entries:
-			self.assertIn(row.serial_no, serial_nos)
+			self.assertIn(frappe.db.get_value("Serial No", row.serial_no, "serial_no"), serial_nos)
 
 		serial_nos.remove("SNU-TSFISI-000015")
 
@@ -3229,7 +4595,9 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		self.assertTrue(sr.items[0].current_serial_and_batch_bundle)
 		self.assertTrue(sr.items[0].serial_and_batch_bundle)
 
-		serial_no_status = frappe.db.get_value("Serial No", "SNU-TSFISI-000015", "status")
+		serial_no_status = frappe.db.get_value(
+			"Serial No", {"item_code": item_code, "serial_no": "SNU-TSFISI-000015"}, "status"
+		)
 
 		self.assertNotEqual(serial_no_status, "Active")
 
@@ -3244,10 +4612,12 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		self.assertEqual(dn.items[0].qty, 4)
 		doc = frappe.get_doc("Serial and Batch Bundle", dn.items[0].serial_and_batch_bundle)
 		for row in doc.entries:
-			self.assertIn(row.serial_no, new_serial_nos)
+			self.assertIn(frappe.db.get_value("Serial No", row.serial_no, "serial_no"), new_serial_nos)
 
 		for sn in new_serial_nos:
-			serial_no_status = frappe.db.get_value("Serial No", sn, "status")
+			serial_no_status = frappe.db.get_value(
+				"Serial No", {"item_code": item_code, "serial_no": sn}, "status"
+			)
 			self.assertNotEqual(serial_no_status, "Active")
 
 		frappe.db.set_single_value(
@@ -3474,7 +4844,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		batch_no = "BATCH-BNU-TPRBI-0001"
 		serial_nos = ["SNU-TPRSI-0001", "SNU-TPRSI-0002", "SNU-TPRSI-0003"]
 
-		if not frappe.db.exists("Batch", batch_no):
+		if not frappe.db.exists("Batch", {"item": batch_item, "batch_id": batch_no}):
 			frappe.get_doc(
 				{
 					"doctype": "Batch",
@@ -3482,6 +4852,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 					"item": batch_item,
 				}
 			).insert()
+		batch_no = frappe.db.get_value("Batch", {"item": batch_item, "batch_id": batch_no}, "name")
 
 		for serial_no in serial_nos:
 			if not frappe.db.exists("Serial No", serial_no):
@@ -3620,7 +4991,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 				"warehouse": "Stores - TCP1",
 				"target_warehouse": "Work In Progress - TCP1",
 				"serial_no": "\n".join(
-					get_serial_nos_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
+					get_serial_numbers_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
 				),
 				"use_serial_batch_fields": 1,
 			},
@@ -3759,7 +5130,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 				"warehouse": "Stores - TCP1",
 				"target_warehouse": "Work In Progress - TCP1",
 				"serial_no": "\n".join(
-					get_serial_nos_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
+					get_serial_numbers_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
 				),
 				"use_serial_batch_fields": 0,
 			},
@@ -4414,7 +5785,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 				"warehouse": "Stores - TCP1",
 				"target_warehouse": "Work In Progress - TCP1",
 				"serial_no": "\n".join(
-					get_serial_nos_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
+					get_serial_numbers_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
 				),
 				"use_serial_batch_fields": 0,
 			},
@@ -4530,7 +5901,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 				"warehouse": "Stores - TCP1",
 				"target_warehouse": "Work In Progress - TCP1",
 				"serial_no": "\n".join(
-					get_serial_nos_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
+					get_serial_numbers_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
 				),
 				"use_serial_batch_fields": 1,
 			},
@@ -4793,7 +6164,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		batch_no = "BATCH-RTN-BNU-TPRBI-0001"
 		serial_nos = ["SNU-RTN-TPRSI-0001", "SNU-RTN-TPRSI-0002", "SNU-RTN-TPRSI-0003"]
 
-		if not frappe.db.exists("Batch", batch_no):
+		if not frappe.db.exists("Batch", {"item": batch_item, "batch_id": batch_no}):
 			frappe.get_doc(
 				{
 					"doctype": "Batch",
@@ -4801,6 +6172,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 					"item": batch_item,
 				}
 			).insert()
+		batch_no = frappe.db.get_value("Batch", {"item": batch_item, "batch_id": batch_no}, "name")
 
 		for serial_no in serial_nos:
 			if not frappe.db.exists("Serial No", serial_no):
@@ -4967,7 +6339,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			item_code=item_code,
 			source=pr.items[0].warehouse,
 			qty=1,
-			serial_no=serial_no,
+			serial_no=frappe.db.get_value("Serial No", serial_no, "serial_no"),
 			use_serial_batch_fields=1,
 		)
 
@@ -4977,7 +6349,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		pr = make_purchase_receipt(
 			item_code=item_code, qty=1, rate=100, use_serial_batch_fields=1, do_not_submit=1
 		)
-		pr.items[0].serial_no = serial_no
+		pr.items[0].serial_no = frappe.db.get_value("Serial No", serial_no, "serial_no")
 		pr.save()
 
 		self.assertRaises(frappe.exceptions.ValidationError, pr.submit)
@@ -4994,12 +6366,14 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		).name
 
 		pr1 = make_purchase_receipt(item_code=sn_item_code, qty=5, rate=100, use_serial_batch_fields=1)
-		pr1_serial_nos = get_serial_nos_from_bundle(pr1.items[0].serial_and_batch_bundle)
+		pr1_serial_nos = get_serial_numbers_from_bundle(pr1.items[0].serial_and_batch_bundle)
 
 		serial_no_pr = make_purchase_receipt(
 			item_code=sn_item_code, qty=5, rate=100, use_serial_batch_fields=1
 		)
-		serial_no_pr_serial_nos = get_serial_nos_from_bundle(serial_no_pr.items[0].serial_and_batch_bundle)
+		serial_no_pr_serial_nos = get_serial_numbers_from_bundle(
+			serial_no_pr.items[0].serial_and_batch_bundle
+		)
 
 		sn_return = make_purchase_return(serial_no_pr.name)
 		sn_return.items[0].qty = -1
@@ -5782,6 +7156,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		doc.reload()
 
 		self.assertEqual(doc.use_batchwise_valuation, 0)
+		first_batch = doc.name
 
 		doc = frappe.new_doc("Batch")
 		doc.update(
@@ -5799,7 +7174,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			qty=10,
 			rate=100,
 			target=warehouse,
-			batch_no="BN-TESTDNUBVWF-00001",
+			batch_no=first_batch,
 			use_serial_batch_fields=1,
 		)
 
@@ -5808,7 +7183,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			qty=10,
 			rate=200,
 			target=warehouse,
-			batch_no="BN-TESTDNUBVWF-00001",
+			batch_no=first_batch,
 			use_serial_batch_fields=1,
 		)
 
@@ -5833,7 +7208,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			qty=10,
 			rate=2,
 			target=warehouse,
-			batch_no="BN-TESTDNUBVWF-00002",
+			batch_no=doc.name,
 			use_serial_batch_fields=1,
 		)
 
@@ -5856,7 +7231,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			item_code=item_code,
 			qty=20,
 			source=warehouse,
-			batch_no="BN-TESTDNUBVWF-00001",
+			batch_no=first_batch,
 			use_serial_batch_fields=1,
 		)
 
@@ -5882,7 +7257,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			qty=20,
 			rate=0,
 			target=warehouse,
-			batch_no="BN-TESTDNUBVWF-00001",
+			batch_no=first_batch,
 			use_serial_batch_fields=1,
 			do_not_submit=1,
 		)
@@ -5921,6 +7296,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		batch_no = "BN-TPRBWV-00001"
 		batch = frappe.new_doc("Batch").update({"batch_id": batch_no, "item": item_code}).insert()
 		self.assertEqual(batch.use_batchwise_valuation, 1)
+		batch_no = batch.name
 
 		warehouse = "_Test Warehouse - _TC"
 		pr = make_purchase_receipt(
@@ -6732,6 +8108,40 @@ def get_items(**args):
 			"cost_center": args.cost_center or "Main - _TC",
 		},
 	]
+
+
+def make_receipts_against_order(purchase_order: str, receipts: tuple) -> list:
+	from erpnext.buying.doctype.purchase_order.mapper import make_purchase_receipt as make_receipt_from_order
+
+	receipt_docs = []
+	for qty, posting_time in receipts:
+		pr = make_receipt_from_order(purchase_order)
+		pr.set_posting_time = 1
+		pr.posting_time = posting_time
+		pr.items[0].received_qty = qty
+		pr.items[0].qty = qty
+		pr.submit()
+		receipt_docs.append(pr)
+
+	return receipt_docs
+
+
+def get_amount_differences(receipts: list) -> list:
+	return [
+		frappe.db.get_value(
+			"Purchase Receipt Item", pr.items[0].name, "amount_difference_with_purchase_invoice"
+		)
+		for pr in receipts
+	]
+
+
+def make_invoice_against_order(purchase_order: str, qty: float, rate: float) -> None:
+	from erpnext.buying.doctype.purchase_order.mapper import make_purchase_invoice as make_invoice_from_order
+
+	pi = make_invoice_from_order(purchase_order)
+	pi.items[0].qty = qty
+	pi.items[0].rate = rate
+	pi.submit()
 
 
 def make_purchase_receipt(**args):

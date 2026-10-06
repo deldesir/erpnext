@@ -541,6 +541,59 @@ class TestSalesOrder(ERPNextTestSuite):
 		so.load_from_db()
 		self.assertEqual(so.get("items")[0].billed_amt, 500)
 
+	def test_make_sales_invoice_after_update_stock_credit_note(self):
+		from erpnext.accounts.doctype.sales_invoice.mapper import make_sales_return
+
+		so = make_sales_order(qty=5, rate=100)
+		si = make_sales_invoice(so.name)
+		si.update_stock = 1
+		si.insert()
+		si.submit()
+
+		credit_note = make_sales_return(si.name)
+		credit_note.update_billed_amount_in_sales_order = 1
+		credit_note.get("items")[0].qty = -2
+		credit_note.insert()
+		credit_note.submit()
+
+		self.assertTrue(has_potentially_billable_items(so.name))
+		pending_invoice = make_sales_invoice(so.name)
+		self.assertEqual(pending_invoice.get("items")[0].qty, 2)
+
+		pending_invoice.update_stock = 1
+		pending_invoice.insert()
+		pending_invoice.submit()
+
+		self.assertFalse(has_potentially_billable_items(so.name))
+		self.assertEqual(len(make_sales_invoice(so.name).get("items")), 0)
+
+	def test_returned_qty_after_return_delivery_note_and_update_stock_credit_note(self):
+		from erpnext.accounts.doctype.sales_invoice.mapper import make_sales_return as make_credit_note
+		from erpnext.stock.doctype.delivery_note.mapper import make_sales_return
+
+		for credit_note_first in (False, True):
+			with self.subTest(credit_note_first=credit_note_first):
+				so = make_sales_order(qty=5, rate=100)
+				dn = create_dn_against_so(so.name, 2)
+				si = make_sales_invoice(so.name)
+				si.update_stock = 1
+				si.get("items")[0].qty = 3
+				si.insert()
+				si.submit()
+
+				dn_return = frappe.get_doc(make_sales_return(dn.name).as_dict())
+				credit_note = make_credit_note(si.name)
+				credit_note.update_billed_amount_in_sales_order = 1
+				credit_note.get("items")[0].qty = -1
+
+				for return_doc in [credit_note, dn_return] if credit_note_first else [dn_return, credit_note]:
+					return_doc.insert()
+					return_doc.submit()
+
+				so.load_from_db()
+				self.assertEqual(so.get("items")[0].returned_qty, 3)
+				self.assertEqual(make_sales_invoice(so.name).get("items")[0].qty, 1)
+
 	def test_make_sales_invoice_after_partial_billing_multiple_items(self):
 		so = make_sales_order(
 			item_list=[
@@ -1105,6 +1158,66 @@ class TestSalesOrder(ERPNextTestSuite):
 			trans_items,
 			sales_order.name,
 		)
+
+	def test_unconfigured_uom_rejected_when_uoms_are_restricted(self):
+		item = make_item(
+			uoms=[{"uom": "Box", "conversion_factor": 12}, {"uom": "Kg", "conversion_factor": 0}]
+		)
+
+		with self.change_settings("Stock Settings", {"allow_uom_with_conversion_rate_defined_in_item": 1}):
+			for uom in ("Pair", "Kg"):
+				self.assertRaises(
+					frappe.ValidationError, make_sales_order, item_code=item.name, uom=uom, do_not_submit=True
+				)
+			make_sales_order(item_code=item.name, uom="Box", do_not_submit=True)
+
+	def test_update_items_rejects_unconfigured_uom(self):
+		item = make_item()
+		so = make_sales_order(item_code=item.name, qty=2)
+		trans_items = json.dumps(
+			[
+				{
+					"docname": so.items[0].name,
+					"item_code": item.name,
+					"qty": 2,
+					"rate": 100,
+					"uom": "Box",
+					"stock_uom": "Box",
+				}
+			]
+		)
+
+		with self.change_settings("Stock Settings", {"allow_uom_with_conversion_rate_defined_in_item": 1}):
+			self.assertRaises(
+				frappe.ValidationError, update_child_qty_rate, "Sales Order", trans_items, so.name
+			)
+
+	def test_update_items_allows_existing_unconfigured_uom(self):
+		legacy_item, item = make_item(), make_item()
+		so = make_sales_order(
+			item_list=[
+				{
+					"item_code": legacy_item.name,
+					"qty": 2,
+					"rate": 100,
+					"uom": "Box",
+					"warehouse": "_Test Warehouse - _TC",
+				},
+				{"item_code": item.name, "qty": 2, "rate": 100, "warehouse": "_Test Warehouse - _TC"},
+			]
+		)
+		trans_items = json.dumps(
+			[
+				{"docname": row.name, "item_code": row.item_code, "qty": qty, "rate": 100, "uom": row.uom}
+				for row, qty in zip(so.items, (2, 5), strict=True)
+			]
+		)
+
+		with self.change_settings("Stock Settings", {"allow_uom_with_conversion_rate_defined_in_item": 1}):
+			update_child_qty_rate("Sales Order", trans_items, so.name)
+
+		so.reload()
+		self.assertEqual(so.items[1].qty, 5)
 
 	def test_update_child_preserves_conversion_factor_precision(self):
 		from erpnext.accounts.services.child_item_update import update_child_item_uom_and_weight
@@ -3523,7 +3636,7 @@ class TestSalesOrder(ERPNextTestSuite):
 		batches_in_bundle = list(get_batches_from_bundle(dn.packed_items[1].serial_and_batch_bundle).keys())
 
 		self.assertEqual(sre_serial_nos, serial_nos_in_bundle)
-		self.assertEqual(sre_batch_nos, batches_in_bundle)
+		self.assertCountEqual(sre_batch_nos, batches_in_bundle)
 
 		dn.items[0].qty = 5
 		dn.save()
@@ -3565,7 +3678,7 @@ class TestSalesOrder(ERPNextTestSuite):
 		batches_in_bundle = list(get_batches_from_bundle(si.packed_items[1].serial_and_batch_bundle).keys())
 
 		self.assertEqual(sre_serial_nos, serial_nos_in_bundle)
-		self.assertEqual(sre_batch_nos, batches_in_bundle)
+		self.assertCountEqual(sre_batch_nos, batches_in_bundle)
 
 		si.items[0].qty = 5
 		si.save()

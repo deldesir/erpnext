@@ -5,12 +5,15 @@
  "allow_rename": 1,
  "autoname": "naming_series:",
  "creation": "2026-07-14 12:46:50.256889",
- "description": "Buyer of Goods and Services.",
+ "description": "A company or person you sell goods or services to.",
  "doctype": "DocType",
  "document_type": "Setup",
  "documentation": "https://docs.frappe.io/erpnext/user/manual/en/customer",
  "engine": "InnoDB",
  "field_order": [
+  "overview_tab",
+  "overview_html",
+  "details_tab",
   "basic_info",
   "naming_series",
   "customer_name",
@@ -75,6 +78,9 @@
   "column_break_53",
   "disabled",
   "is_frozen",
+  "block_customer_section",
+  "on_hold",
+  "release_date",
   "sales_team_tab",
   "account_manager",
   "sales_team",
@@ -104,6 +110,22 @@
   "connections_tab"
  ],
  "fields": [
+  {
+   "fieldname": "overview_tab",
+   "fieldtype": "Tab Break",
+   "label": "Overview"
+  },
+  {
+   "depends_on": "eval: !doc.__islocal",
+   "fieldname": "overview_html",
+   "fieldtype": "HTML",
+   "label": "Overview HTML"
+  },
+  {
+   "fieldname": "details_tab",
+   "fieldtype": "Tab Break",
+   "label": "Details"
+  },
   {
    "fieldname": "basic_info",
    "fieldtype": "Section Break",
@@ -189,6 +211,7 @@
   {
    "fieldname": "customer_group",
    "fieldtype": "Link",
+   "in_import_template": 1,
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Customer Group",
@@ -201,6 +224,7 @@
   {
    "fieldname": "territory",
    "fieldtype": "Link",
+   "in_import_template": 1,
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Territory",
@@ -212,12 +236,15 @@
   {
    "fieldname": "tax_id",
    "fieldtype": "Data",
+   "in_global_search": 1,
+   "in_import_template": 1,
    "label": "Tax ID"
   },
   {
    "description": "Controls which tax template is auto-applied when this customer is selected on a transaction.",
    "fieldname": "tax_category",
    "fieldtype": "Link",
+   "in_import_template": 1,
    "label": "Tax Category",
    "options": "Tax Category"
   },
@@ -238,11 +265,13 @@
   },
   {
    "depends_on": "is_internal_customer",
+   "description": "Select the related company that this Customer represents for inter-company transactions.",
    "fieldname": "represents_company",
    "fieldtype": "Link",
    "ignore_user_permissions": 1,
    "label": "Represents Company",
    "options": "Company",
+   "show_description_on_click": 1,
    "unique": 1
   },
   {
@@ -257,6 +286,7 @@
    "fieldname": "default_currency",
    "fieldtype": "Link",
    "ignore_user_permissions": 1,
+   "in_import_template": 1,
    "in_list_view": 1,
    "label": "Billing Currency",
    "no_copy": 1,
@@ -268,6 +298,7 @@
    "fieldname": "default_price_list",
    "fieldtype": "Link",
    "ignore_user_permissions": 1,
+   "in_import_template": 1,
    "label": "Price List",
    "link_filters": "[[\"Price List\", \"selling\", \"=\", 1]]",
    "options": "Price List",
@@ -330,6 +361,7 @@
    "fieldname": "mobile_no",
    "fieldtype": "Read Only",
    "hidden": 1,
+   "in_global_search": 1,
    "label": "Mobile No",
    "no_copy": 1,
    "options": "Mobile"
@@ -339,6 +371,7 @@
    "fieldname": "email_id",
    "fieldtype": "Read Only",
    "hidden": 1,
+   "in_global_search": 1,
    "label": "Email Id",
    "no_copy": 1,
    "options": "Email"
@@ -383,6 +416,7 @@
    "description": "Defines when payment is due (e.g. Net 30, 50% advance). Applied automatically on invoices for this customer.",
    "fieldname": "payment_terms",
    "fieldtype": "Link",
+   "in_import_template": 1,
    "label": "Payment Terms Template",
    "options": "Payment Terms Template",
    "show_description_on_click": 1
@@ -416,6 +450,26 @@
    "fieldtype": "Check",
    "label": "Is Frozen",
    "show_description_on_click": 1
+  },
+  {
+   "fieldname": "block_customer_section",
+   "fieldtype": "Section Break",
+   "label": "Block Customer"
+  },
+  {
+   "default": "0",
+   "description": "Blocks saving or submitting Sales Orders, Delivery Notes, Sales Invoices and POS Invoices for this customer.",
+   "fieldname": "on_hold",
+   "fieldtype": "Check",
+   "label": "Block Customer",
+   "show_description_on_click": 1
+  },
+  {
+   "depends_on": "eval:doc.on_hold",
+   "description": "Leave blank if the Customer is blocked indefinitely",
+   "fieldname": "release_date",
+   "fieldtype": "Date",
+   "label": "Release Date"
   },
   {
    "description": "Loyalty scheme this customer earns points under. Auto-assigned if a matching program exists.",
@@ -731,7 +785,7 @@
    "link_fieldname": "party"
   }
  ],
- "modified": "2026-08-21 23:11:41.175219",
+ "modified": "2026-09-30 23:24:44.044604",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "Customer",

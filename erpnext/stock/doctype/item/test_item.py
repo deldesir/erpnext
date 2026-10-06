@@ -22,6 +22,7 @@ from erpnext.stock.doctype.item.item import (
 	get_item_attribute,
 	get_timeline_data,
 	get_uom_conv_factor,
+	set_item_default,
 	validate_is_stock_item,
 )
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
@@ -400,6 +401,14 @@ class TestItem(ERPNextTestSuite):
 		for key, value in purchase_item_check.items():
 			self.assertEqual(value, purchase_item_details.get(key))
 
+	def test_set_item_default_refreshes_cached_item(self):
+		item = make_item(properties={"item_defaults": [{"company": "_Test Company"}]})
+
+		set_item_default(item.name, "_Test Company", "income_account", "_Test Account Sales - _TC")
+
+		cached_item = frappe.get_cached_doc("Item", item.name)
+		self.assertEqual(cached_item.item_defaults[0].income_account, "_Test Account Sales - _TC")
+
 	def test_item_default_validations(self):
 		with self.assertRaises(frappe.ValidationError) as ve:
 			make_item(
@@ -772,6 +781,32 @@ class TestItem(ERPNextTestSuite):
 		conversion_factor = next(row.conversion_factor for row in item.uoms if row.uom == "Square Meter")
 		self.assertEqual(conversion_factor, custom_factor)
 
+	def test_default_uoms_need_conversion_when_uoms_are_restricted(self):
+		with self.change_settings("Stock Settings", {"allow_uom_with_conversion_rate_defined_in_item": 1}):
+			self.assertRaises(frappe.ValidationError, make_item, properties={"sales_uom": "Box"})
+			self.assertRaises(frappe.ValidationError, make_item, properties={"purchase_uom": "Box"})
+			make_item(
+				properties={"sales_uom": "Box", "purchase_uom": "Box"},
+				uoms=[{"uom": "Box", "conversion_factor": 12}],
+			)
+
+		with self.change_settings("Stock Settings", {"allow_uom_with_conversion_rate_defined_in_item": 0}):
+			make_item(properties={"sales_uom": "Box", "purchase_uom": "Box"})
+
+	def test_variant_default_uom_can_use_template_conversion(self):
+		template = make_item(
+			properties={"has_variants": 1, "attributes": [{"attribute": "Test Size"}]},
+			uoms=[{"uom": "Box", "conversion_factor": 12}],
+		)
+		variant = create_variant(template.name, {"Test Size": "Small"})
+		variant.uoms = []
+		variant.sales_uom = "Box"
+
+		with self.change_settings("Stock Settings", {"allow_uom_with_conversion_rate_defined_in_item": 1}):
+			variant.insert()
+
+		self.assertNotIn("Box", [row.uom for row in variant.uoms])
+
 	def test_uom_conv_intermediate(self):
 		factor = get_uom_conv_factor("Pound", "Gram")
 		self.assertAlmostEqual(factor, 453.592, 3)
@@ -990,6 +1025,29 @@ class TestItem(ERPNextTestSuite):
 			validate_is_stock_item("_Test Item")
 		except frappe.ValidationError as e:
 			self.fail(f"stock item considered non-stock item: {e}")
+
+	def test_serial_and_batch_flags_blocked_when_not_activated(self):
+		serial_item = make_item("_Test Serial Activation Item", {"has_serial_no": 1})
+		batch_item = make_item("_Test Batch Activation Item", {"has_batch_no": 1, "create_new_batch": 1})
+		plain_item = make_item("_Test Serial Batch Plain Item")
+
+		# set directly as test data already has serial / batch records blocking the settings save
+		frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", 0)
+		self.addCleanup(
+			frappe.db.set_single_value, "Stock Settings", "enable_serial_and_batch_no_for_item", 1
+		)
+
+		for fieldname in ("has_serial_no", "has_batch_no"):
+			item = frappe.get_doc("Item", plain_item.name)
+			item.set(fieldname, 1)
+			with self.assertRaisesRegex(frappe.ValidationError, "Activate Serial / Batch No for Item"):
+				item.save()
+
+		# items already tracking serial / batch stay editable
+		for item in (serial_item, batch_item):
+			item.reload()
+			item.description = "Updated after deactivation"
+			item.save()
 
 	@ERPNextTestSuite.change_settings("Stock Settings", {"item_naming_by": "Naming Series"})
 	def test_autoname_series(self):
@@ -1268,7 +1326,7 @@ class TestItem(ERPNextTestSuite):
 		).name
 
 		serial_no = f"{item}-SN-01"
-		frappe.get_doc(
+		serial = frappe.get_doc(
 			{"doctype": "Serial No", "serial_no": serial_no, "item_code": item, "company": "_Test Company"}
 		).insert()
 
@@ -1281,7 +1339,7 @@ class TestItem(ERPNextTestSuite):
 				"qty": 1,
 				"rate": 100,
 				"voucher_type": "Stock Entry",
-				"serial_nos": [serial_no],
+				"serial_nos": [serial.name],
 				"type_of_transaction": "Inward",
 				"do_not_submit": True,
 				"ignore_sabb_validation": True,
