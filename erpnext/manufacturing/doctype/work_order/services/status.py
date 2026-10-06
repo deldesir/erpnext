@@ -111,6 +111,9 @@ class StatusService:
 		"""Return the status based on stock entries against this work order"""
 		status = status or self.doc.status
 
+		if self.doc.docstatus == 1 and status == "Closed":
+			return status
+
 		if self.doc.docstatus == 0:
 			status = "Draft"
 		elif self.doc.docstatus == 1:
@@ -423,8 +426,8 @@ class StatusService:
 
 		doc = frappe.get_doc("Production Plan", self.doc.production_plan)
 		doc.flags.ignore_permissions = True
-		doc.set_status()
-		doc.db_set("status", doc.status)
+		doc.update_status_and_bin_qty()
+		doc.update_raw_material_bin_qty({d.item_code for d in self.doc.required_items})
 
 	def _production_plan_ordered_qty(self):
 		table = frappe.qb.DocType("Work Order")

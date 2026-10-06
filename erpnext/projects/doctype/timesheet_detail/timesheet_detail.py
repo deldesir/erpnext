@@ -73,12 +73,12 @@ class TimesheetDetail(Document):
 
 	def update_cost(self, employee: str):
 		"""Update costing and billing rates based on activity type."""
-		from erpnext.projects.doctype.timesheet.timesheet import get_activity_cost
+		from erpnext.projects.doctype.timesheet.timesheet import _get_activity_cost
 
 		if not self.is_billable and not self.activity_type:
 			return
 
-		rate = get_activity_cost(employee, self.activity_type)
+		rate = _get_activity_cost(employee, self.activity_type)
 		if not rate:
 			return
 
@@ -126,6 +126,12 @@ class TimesheetDetail(Document):
 						self.idx, frappe.bold(self.task), frappe.bold(self.project)
 					)
 				)
+
+	def validate_activity_type(self):
+		if self.activity_type and frappe.get_cached_value("Activity Type", self.activity_type, "disabled"):
+			frappe.throw(
+				_("Row {0}: Activity Type {1} is disabled").format(self.idx, frappe.bold(self.activity_type))
+			)
 
 	def validate_billing_hours(self):
 		"""Warn if billing hours are more than actual hours."""

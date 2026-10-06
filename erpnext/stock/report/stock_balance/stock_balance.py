@@ -45,6 +45,12 @@ def execute(filters: StockBalanceFilter | None = None):
 	return StockBalanceReport(filters).run()
 
 
+def execute_snapshot_report(filters: StockBalanceFilter | None = None):
+	from erpnext.stock.report.stock_balance.stock_balance_snapshot import execute as execute_from_snapshot
+
+	return execute_from_snapshot(filters)
+
+
 class StockBalanceReport:
 	def __init__(self, filters: StockBalanceFilter | None) -> None:
 		self.filters = filters
@@ -110,6 +116,11 @@ class StockBalanceReport:
 			)
 
 	def get_entries_from_stock_closing_balance(self) -> list:
+		# The SLE query then starts from the very first entry, so loading the closing balance as
+		# opening too would count everything up to the closing date twice.
+		if self.filters.get("ignore_closing_balance"):
+			return []
+
 		stk_cl_obj = StockClosing(self.filters.company, self.from_date, self.from_date)
 		if not stk_cl_obj.last_closing_balance:
 			return []
@@ -136,7 +147,9 @@ class StockBalanceReport:
 		if not opening_entries:
 			return []
 
-		return opening_entries
+		# Batch wise rows carry no inventory dimension key either, but they share the item and
+		# warehouse group key with the item level row and would overwrite its opening.
+		return [d for d in opening_entries if not d.batch_no]
 
 	def filter_fields(self) -> list[str]:
 		fields = ["item_code", "warehouse"]
@@ -182,6 +195,9 @@ class StockBalanceReport:
 			.orderby(sle.creation)
 		)
 
+		self.sle_query = self.apply_filters(query, sle, item_table)
+
+	def apply_filters(self, query, sle, item_table):
 		query = self.apply_inventory_dimensions_filters(query, sle)
 		query = self.apply_warehouse_filters(query, sle)
 		query = self.apply_items_filters(query, item_table)
@@ -190,7 +206,7 @@ class StockBalanceReport:
 		if self.filters.get("company"):
 			query = query.where(sle.company == self.filters.get("company"))
 
-		self.sle_query = query
+		return query
 
 	def prepare_item_warehouse_map_for_current_period(self):
 		self.opening_vouchers = self.get_opening_vouchers()
@@ -320,15 +336,13 @@ class StockBalanceReport:
 				{"reserved_stock": sre_details.get((report_data.item_code, report_data.warehouse), 0.0)}
 			)
 
-			if (
-				not self.filters.get("include_zero_stock_items")
-				and report_data
-				and report_data.bal_qty == 0
-				and report_data.bal_val == 0
-			):
+			if self.is_hidden_zero_stock(report_data):
 				continue
 
 			self.data.append(report_data)
+
+	def is_hidden_zero_stock(self, row) -> bool:
+		return not self.filters.get("include_zero_stock_items") and row.bal_qty == 0 and row.bal_val == 0
 
 	def get_sre_reserved_qty_details(self) -> dict:
 		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
@@ -368,6 +382,10 @@ class StockBalanceReport:
 			qty_diff = flt(entry.actual_qty)
 			value_diff = flt(entry.stock_value_difference)
 
+		qty_dict.val_rate = entry.valuation_rate
+		self.add_to_balance(qty_dict, entry, qty_diff, value_diff)
+
+	def add_to_balance(self, qty_dict, entry, qty_diff, value_diff):
 		if entry.posting_date < self.from_date or entry.voucher_no in self.opening_vouchers.get(
 			entry.voucher_type, []
 		):
@@ -385,12 +403,14 @@ class StockBalanceReport:
 			else:
 				qty_dict.out_val += abs(value_diff)
 
-		qty_dict.val_rate = entry.valuation_rate
 		qty_dict.bal_qty += qty_diff
 		qty_dict.bal_val += value_diff
 
 	def initialize_data(self, group_by_key, entry):
-		self.item_warehouse_map[group_by_key] = frappe._dict(
+		self.item_warehouse_map[group_by_key] = self.get_initial_data(entry)
+
+	def get_initial_data(self, entry):
+		return frappe._dict(
 			{
 				"item_code": entry.item_code,
 				"warehouse": entry.warehouse,

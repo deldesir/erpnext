@@ -1,6 +1,7 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
+from unittest.mock import patch
 
 from frappe.permissions import add_user_permission, remove_user_permission
 from frappe.utils import add_days, cstr, flt, get_time, getdate, nowtime, today
@@ -580,6 +581,61 @@ class TestStockEntry(ERPNextTestSuite):
 
 		mtn.cancel()
 
+	def test_material_transfer_on_half_cent_moves_no_value(self):
+		item_code = make_item(properties={"is_stock_item": 1, "valuation_method": "Moving Average"}).name
+		self.assert_half_cent_transfer_moves_no_value(item_code)
+
+	def test_batch_transfer_on_half_cent_moves_no_value(self):
+		item_code = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "HCBT-.#####",
+			}
+		).name
+		self.assert_half_cent_transfer_moves_no_value(item_code)
+
+	def test_serial_transfer_without_serial_wise_valuation_on_half_cent_moves_no_value(self):
+		item_code = make_item(
+			properties={
+				"is_stock_item": 1,
+				"valuation_method": "Moving Average",
+				"has_serial_no": 1,
+				"serial_no_series": "HCSN-.#####",
+				"use_serial_no_wise_valuation": 0,
+			}
+		).name
+		self.assert_half_cent_transfer_moves_no_value(item_code)
+
+	def assert_half_cent_transfer_moves_no_value(self, item_code):
+		receipt = make_stock_entry(
+			item_code=item_code, target="_Test Warehouse - _TC", qty=2, basic_rate=10.005
+		)
+		bundle = receipt.items[0].serial_and_batch_bundle
+		has_batch_no, has_serial_no = frappe.get_cached_value(
+			"Item", item_code, ["has_batch_no", "has_serial_no"]
+		)
+
+		transfer = make_stock_entry(
+			item_code=item_code,
+			source="_Test Warehouse - _TC",
+			target="_Test Warehouse 1 - _TC",
+			qty=1,
+			batch_no=get_batch_from_bundle(bundle) if has_batch_no else None,
+			serial_no=get_serial_nos_from_bundle(bundle)[:1] if has_serial_no else None,
+		)
+
+		outward, inward = (
+			frappe.db.get_value(
+				"Stock Ledger Entry",
+				{"voucher_no": transfer.name, "warehouse": warehouse, "is_cancelled": 0},
+				"stock_value_difference",
+			)
+			for warehouse in ("_Test Warehouse - _TC", "_Test Warehouse 1 - _TC")
+		)
+		self.assertEqual(flt(inward, 2), -flt(outward, 2))
+
 	def test_repack_multiple_fg(self):
 		"Test `is_finished_item` for one item repacked into two items."
 		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=100, basic_rate=100)
@@ -1044,13 +1100,21 @@ class TestStockEntry(ERPNextTestSuite):
 	def test_serial_no_transfer_in(self):
 		serial_nos = ["ABCD1", "EFGH1"]
 		for serial_no in serial_nos:
-			if not frappe.db.exists("Serial No", serial_no):
+			if not frappe.db.exists(
+				"Serial No", {"item_code": "_Test Serialized Item", "serial_no": serial_no}
+			):
 				doc = frappe.new_doc("Serial No")
 				doc.serial_no = serial_no
 				doc.item_code = "_Test Serialized Item"
 				doc.company = "_Test Company"
 				doc.insert(ignore_permissions=True)
 
+		serial_nos = [
+			frappe.db.get_value(
+				"Serial No", {"item_code": "_Test Serialized Item", "serial_no": number}, "name"
+			)
+			for number in serial_nos
+		]
 		se = frappe.copy_doc(self.globalTestRecords["Stock Entry"][0])
 		se.get("items")[0].item_code = "_Test Serialized Item"
 		se.get("items")[0].qty = 2
@@ -1076,11 +1140,11 @@ class TestStockEntry(ERPNextTestSuite):
 		se.insert()
 		se.submit()
 
-		self.assertTrue(frappe.db.get_value("Serial No", "ABCD1", "warehouse"))
-		self.assertTrue(frappe.db.get_value("Serial No", "EFGH1", "warehouse"))
+		self.assertTrue(frappe.db.get_value("Serial No", serial_nos[0], "warehouse"))
+		self.assertTrue(frappe.db.get_value("Serial No", serial_nos[1], "warehouse"))
 
 		se.cancel()
-		self.assertFalse(frappe.db.get_value("Serial No", "ABCD1", "warehouse"))
+		self.assertFalse(frappe.db.get_value("Serial No", serial_nos[0], "warehouse"))
 
 	def test_serial_by_series(self):
 		se = make_serialized_item(self)
@@ -1095,24 +1159,24 @@ class TestStockEntry(ERPNextTestSuite):
 	def test_serial_move(self):
 		se = make_serialized_item(self)
 		serial_no = get_serial_nos_from_bundle(se.get("items")[0].serial_and_batch_bundle)[0]
-		frappe.flags.use_serial_and_batch_fields = True
+		with patch.dict(frappe.flags, {"use_serial_and_batch_fields": True}):
+			se = frappe.copy_doc(self.globalTestRecords["Stock Entry"][0])
+			se.purpose = "Material Transfer"
+			se.get("items")[0].item_code = "_Test Serialized Item With Series"
+			se.get("items")[0].qty = 1
+			se.get("items")[0].transfer_qty = 1
+			se.get("items")[0].serial_no = frappe.db.get_value("Serial No", serial_no, "serial_no")
+			se.get("items")[0].s_warehouse = "_Test Warehouse - _TC"
+			se.get("items")[0].t_warehouse = "_Test Warehouse 1 - _TC"
+			se.set_stock_entry_type()
+			se.insert()
+			se.submit()
+			self.assertTrue(
+				frappe.db.get_value("Serial No", serial_no, "warehouse"), "_Test Warehouse 1 - _TC"
+			)
 
-		se = frappe.copy_doc(self.globalTestRecords["Stock Entry"][0])
-		se.purpose = "Material Transfer"
-		se.get("items")[0].item_code = "_Test Serialized Item With Series"
-		se.get("items")[0].qty = 1
-		se.get("items")[0].transfer_qty = 1
-		se.get("items")[0].serial_no = [serial_no]
-		se.get("items")[0].s_warehouse = "_Test Warehouse - _TC"
-		se.get("items")[0].t_warehouse = "_Test Warehouse 1 - _TC"
-		se.set_stock_entry_type()
-		se.insert()
-		se.submit()
-		self.assertTrue(frappe.db.get_value("Serial No", serial_no, "warehouse"), "_Test Warehouse 1 - _TC")
-
-		se.cancel()
-		self.assertTrue(frappe.db.get_value("Serial No", serial_no, "warehouse"), "_Test Warehouse - _TC")
-		frappe.flags.use_serial_and_batch_fields = False
+			se.cancel()
+			self.assertTrue(frappe.db.get_value("Serial No", serial_no, "warehouse"), "_Test Warehouse - _TC")
 
 	def test_serial_cancel(self):
 		se, serial_nos = self.test_serial_by_series()
@@ -2738,6 +2802,7 @@ class TestStockEntry(ERPNextTestSuite):
 		)
 
 		# Executing an illegal sequence should raise an error
+		batch_no = frappe.db.get_value("Batch", {"item": item_code, "batch_id": batch_no}, "name")
 		sequence_of_entries = [
 			dict(
 				item_code=item_code,
@@ -3239,8 +3304,11 @@ class TestStockEntry(ERPNextTestSuite):
 		self.assertTrue(se.items[0].serial_and_batch_bundle)
 
 		for serial_no in serial_nos:
-			self.assertTrue(frappe.db.exists("Serial No", serial_no))
-			self.assertEqual(frappe.db.get_value("Serial No", serial_no, "status"), "Active")
+			self.assertTrue(frappe.db.exists("Serial No", {"item_code": item.name, "serial_no": serial_no}))
+			self.assertEqual(
+				frappe.db.get_value("Serial No", {"item_code": item.name, "serial_no": serial_no}, "status"),
+				"Active",
+			)
 
 		se1 = make_stock_entry(
 			item_code=item.name,
@@ -3257,8 +3325,11 @@ class TestStockEntry(ERPNextTestSuite):
 		self.assertTrue(se1.items[0].serial_and_batch_bundle)
 
 		for serial_no in serial_nos:
-			self.assertTrue(frappe.db.exists("Serial No", serial_no))
-			self.assertEqual(frappe.db.get_value("Serial No", serial_no, "status"), "Consumed")
+			self.assertTrue(frappe.db.exists("Serial No", {"item_code": item.name, "serial_no": serial_no}))
+			self.assertEqual(
+				frappe.db.get_value("Serial No", {"item_code": item.name, "serial_no": serial_no}, "status"),
+				"Consumed",
+			)
 
 	def test_serial_batch_bundle_type_of_transaction(self):
 		item = make_item(
@@ -3625,7 +3696,7 @@ class TestStockEntry(ERPNextTestSuite):
 				"uom": item_doc.stock_uom,
 				"qty": 1,
 				"use_serial_batch_fields": 1,
-				"serial_no": delivered_serial_no,
+				"serial_no": frappe.db.get_value("Serial No", delivered_serial_no, "serial_no"),
 			},
 		)
 
@@ -4153,6 +4224,60 @@ class TestStockEntry(ERPNextTestSuite):
 		se.calculate_rate_and_amount()
 		se.save()
 		se.submit()
+
+	def test_bom_rows_in_non_stock_uom_are_converted_once(self):
+		box = [{"uom": "Box", "conversion_factor": 12}]
+		rm_item = make_item("_Test BOM Box Raw Material", {"is_stock_item": 1, "uoms": box}).name
+		secondary_item = make_item("_Test BOM Box Secondary Item", {"is_stock_item": 1, "uoms": box}).name
+		fg_item = make_item("_Test BOM Box Finished Good", {"is_stock_item": 1}).name
+		bom = frappe.get_doc(
+			{
+				"doctype": "BOM",
+				"item": fg_item,
+				"company": "_Test Company",
+				"quantity": 1,
+				"items": [
+					{"item_code": rm_item, "qty": 1, "uom": "Box", "conversion_factor": 12, "rate": 10}
+				],
+				"secondary_items": [
+					{
+						"item_code": secondary_item,
+						"qty": 1,
+						"uom": "Box",
+						"conversion_factor": 12,
+						"secondary_item_type": "Scrap",
+					}
+				],
+			}
+		)
+		bom.insert()
+		bom.submit()
+
+		for purpose in ("Manufacture", "Repack", "Material Issue", "Disassemble"):
+			with self.subTest(purpose=purpose):
+				se = frappe.get_doc(
+					{
+						"doctype": "Stock Entry",
+						"company": "_Test Company",
+						"purpose": purpose,
+						"posting_date": nowdate(),
+						"posting_time": nowtime(),
+						"from_bom": 1,
+						"bom_no": bom.name,
+						"use_multi_level_bom": 0,
+						"fg_completed_qty": 2,
+						"from_warehouse": "_Test Warehouse - _TC",
+						"to_warehouse": "_Test Warehouse - _TC",
+					}
+				)
+				se.set_stock_entry_type()
+				se.get_items()
+				se.insert()
+
+				bom_rows = [row for row in se.items if row.item_code != fg_item]
+				self.assertTrue(bom_rows)
+				for row in bom_rows:
+					self.assertEqual(row.transfer_qty, 24)
 
 	def test_disassemble_blocks_finished_good_qty_tampering(self):
 		# A disassembly consuming N finished goods must consume exactly N (in stock UOM).
@@ -4881,27 +5006,149 @@ class TestStockEntryCoverage(ERPNextTestSuite):
 		frappe.db.set_value("Work Order", wo.name, "produced_qty", wo.qty)
 		self.assertNotIn(wo.name, pending_work_orders())
 
-	def test_process_loss_percentage_resyncs_from_qty(self):
-		# changing fg qty recomputes process_loss_qty and process_loss_percentage
-		se = frappe.new_doc("Stock Entry")
-		se.purpose = "Manufacture"
+	def make_process_loss_entry(self, purpose="Manufacture", fg_item=None):
+		"""Entry for 100 units from a BOM with 5% process loss, items fetched but not saved."""
+		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
+
+		fg_item = fg_item or make_item("Process Loss FG", properties={"is_stock_item": 1}).name
+		rm_item = make_item("Process Loss RM", properties={"is_stock_item": 1}).name
+
+		se = make_stock_entry(
+			item_code=fg_item, qty=100, purpose=purpose, company="_Test Company", do_not_save=True
+		)
+		se.items = []
+		se.from_bom = 1
+		se.bom_no = make_bom(
+			item=fg_item, quantity=100, raw_materials=[rm_item], process_loss_percentage=5
+		).name
+		se.fg_completed_qty = 100
+		se.from_warehouse = "_Test Warehouse - _TC"
+		se.to_warehouse = "_Test Warehouse 1 - _TC"
+		se.get_items()
+		return se
+
+	def get_finished_good_row(self, se):
+		return next(row for row in se.items if row.is_finished_item)
+
+	def test_process_loss_follows_finished_good_qty(self):
+		for purpose in ("Manufacture", "Repack"):
+			se = self.make_process_loss_entry(purpose)
+			self.assertEqual(self.get_finished_good_row(se).qty, 95)
+
+			self.get_finished_good_row(se).qty = 90
+			se.save()
+
+			self.assertEqual(se.process_loss_qty, 10)
+			self.assertEqual(se.process_loss_percentage, 10)
+
+	def test_process_loss_counts_variant_of_bom_item(self):
+		make_item_variant()
+		se = self.make_process_loss_entry(fg_item="_Test Variant Item")
+		self.get_finished_good_row(se).item_code = "_Test Variant Item-S"
+		self.get_finished_good_row(se).qty = 90
+		se.save()
+
+		self.assertEqual(se.process_loss_qty, 10)
+
+	def test_from_bom_entry_rejects_variant_in_another_stock_uom(self):
+		from erpnext.controllers.item_variant import create_variant
+
+		frappe.delete_doc_if_exists("Item", "_Test Variant Item-L", force=1)
+		with self.change_settings("Item Variant Settings", {"allow_different_uom": 1}):
+			variant = create_variant("_Test Variant Item", {"Test Size": "Large"})
+			variant.stock_uom = "_Test UOM 1"
+			variant.insert()
+
+		se = self.make_process_loss_entry(fg_item="_Test Variant Item")
+		fg_row = self.get_finished_good_row(se)
+		fg_row.item_code = variant.name
+		fg_row.uom = "_Test UOM 1"
+		fg_row.conversion_factor = 1
+
+		self.assertRaisesRegex(FinishedGoodError, "has stock UOM", se.save)
+
+	def test_from_bom_entry_rejects_alternative_of_bom_item(self):
+		properties = {"is_stock_item": 1, "allow_alternative_item": 1}
+		fg_item = make_item("Process Loss Alternative Source", properties=properties).name
+		alternative = make_item("Process Loss Alternative FG", properties=properties).name
+		frappe.get_doc(
+			{"doctype": "Item Alternative", "item_code": fg_item, "alternative_item_code": alternative}
+		).insert()
+
+		se = self.make_process_loss_entry(fg_item=fg_item)
+		self.get_finished_good_row(se).item_code = alternative
+
+		self.assertRaises(FinishedGoodError, se.save)
+
+	def test_process_loss_ignores_finished_flag_on_source_row(self):
+		se = self.make_process_loss_entry()
+		se.append(
+			"items",
+			{
+				"item_code": self.get_finished_good_row(se).item_code,
+				"qty": 5,
+				"uom": "Nos",
+				"conversion_factor": 1,
+				"s_warehouse": "_Test Warehouse - _TC",
+				"is_finished_item": 1,
+			},
+		)
+		se.to_warehouse = None
+		se.save()
+
+		self.assertEqual(se.process_loss_qty, 5)
+
+	def test_from_bom_entry_rejects_finished_item_other_than_bom_item(self):
+		other_item = make_item("Process Loss Unrelated FG", properties={"is_stock_item": 1}).name
+		for purpose in ("Manufacture", "Repack"):
+			se = self.make_process_loss_entry(purpose)
+			self.get_finished_good_row(se).item_code = other_item
+
+			self.assertRaises(FinishedGoodError, se.save)
+
+	def test_process_loss_ignores_other_repack_outputs(self):
+		other_item = make_item("Process Loss Other Output", properties={"is_stock_item": 1}).name
+		se = self.make_process_loss_entry("Repack")
+		fg_row = self.get_finished_good_row(se)
+		fg_row.set_basic_rate_manually = 1
+		fg_row.basic_rate = 10
+		other_output = se.append(
+			"items",
+			{
+				"item_code": other_item,
+				"qty": 10,
+				"uom": "Nos",
+				"conversion_factor": 1,
+				"t_warehouse": "_Test Warehouse 1 - _TC",
+				"is_finished_item": 1,
+				"set_basic_rate_manually": 1,
+				"basic_rate": 10,
+			},
+		)
+		se.items.remove(other_output)
+		se.items.insert(0, other_output)
+		se.save()
+
+		self.assertEqual(se.process_loss_qty, 5)
+
+	def test_zero_process_loss_saves_despite_bom_percentage(self):
+		se = self.make_process_loss_entry()
+		self.get_finished_good_row(se).qty = 100
+		se.save()
+
+		self.assertEqual(se.process_loss_qty, 0)
+		self.assertEqual(se.process_loss_percentage, 0)
+
+	def test_get_items_recomputes_process_loss_from_bom(self):
+		se = self.make_process_loss_entry()
+		se.save()
+
 		se.fg_completed_qty = 200
-		se.process_loss_qty = 100
-		se.process_loss_percentage = 80
+		se.get_items()
 
-		se.set_process_loss_qty()
-
-		self.assertEqual(se.process_loss_percentage, 50)
-
-	def test_process_loss_qty_derived_from_percentage_when_qty_blank(self):
-		se = frappe.new_doc("Stock Entry")
-		se.purpose = "Manufacture"
-		se.fg_completed_qty = 200
-		se.process_loss_percentage = 25
-
-		se.set_process_loss_qty()
-
-		self.assertEqual(se.process_loss_qty, 50)
+		self.assertEqual(se.process_loss_qty, 10)
+		self.assertEqual(se.process_loss_percentage, 5)
+		self.assertEqual(self.get_finished_good_row(se).qty, 190)
 
 
 def make_serialized_item(self, **args):
@@ -5008,7 +5255,7 @@ def initialize_records_for_future_negative_sle_test(
 	from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
 
 	TestBatch.make_batch_item(item_code)
-	make_new_batch(item_code=item_code, batch_id=batch_no)
+	batch = make_new_batch(item_code=item_code, batch_id=batch_no)
 	warehouse_names = [create_warehouse(w) for w in warehouses]
 	create_stock_reconciliation(
 		purpose="Opening Stock",
@@ -5018,7 +5265,7 @@ def initialize_records_for_future_negative_sle_test(
 		warehouse=warehouse_names[0],
 		valuation_rate=100,
 		qty=opening_qty,
-		batch_no=batch_no,
+		batch_no=batch.name,
 	)
 	return warehouse_names
 

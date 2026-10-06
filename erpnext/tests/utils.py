@@ -176,6 +176,7 @@ class BootStrapTestData:
 		self.make_item_attribute()
 		self.make_asset_maintenance_team()
 		self.make_asset_category()
+		self.update_stock_settings()
 		self.make_item()
 		self.make_product_bundle()
 		self.make_location()
@@ -205,7 +206,6 @@ class BootStrapTestData:
 		self.make_contact()
 		self.update_support_settings()
 		self.update_selling_settings()
-		self.update_stock_settings()
 
 		frappe.db.commit()  # nosemgrep
 
@@ -3107,3 +3107,16 @@ def change_settings(doctype, settings_dict=None, /, **settings) -> None:
 	for key, value in previous_settings.items():
 		setattr(settings, key, value)
 	settings.save(ignore_permissions=True)
+
+
+def make_email_template(subject: str, response: str) -> str:
+	"""Insert a test Email Template and return its name."""
+	template = frappe.get_doc(
+		{
+			"doctype": "Email Template",
+			"name": "_Test Email Template",
+			"subject": subject,
+			"response": response,
+		}
+	).insert()
+	return template.name

@@ -186,6 +186,12 @@ status_map = {
 		["Completed", "eval:self.purpose == 'Delivery' and self.delivery_status == 'Fully Delivered'"],
 		["Cancelled", "eval:self.docstatus == 2"],
 	],
+	"Blanket Order": [
+		["Draft", None],
+		["Submitted", "eval:self.docstatus == 1"],
+		["Closed", "eval:self.status == 'Closed' and self.docstatus == 1"],
+		["Cancelled", "eval:self.docstatus == 2"],
+	],
 }
 
 
@@ -388,7 +394,7 @@ class StatusUpdater(Document):
 						)
 					)
 
-			if items_to_validate:
+			if items_to_validate and args.get("validate_overflow") is not False:
 				pp_sub_assembly_items = [
 					item.production_plan_sub_assembly_item
 					for item in items_to_validate

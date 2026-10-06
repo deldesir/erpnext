@@ -37,6 +37,12 @@ from erpnext.stock.doctype.purchase_receipt.mapper import (
 	make_purchase_invoice as make_invoice,
 )
 from erpnext.stock.doctype.purchase_receipt.test_purchase_receipt import make_purchase_receipt
+from erpnext.tests.permission_test_utils import (
+	as_user,
+	assert_refused_for_names,
+	make_company_fenced_user,
+	make_fenced_user,
+)
 from erpnext.tests.utils import ERPNextTestSuite
 
 
@@ -902,6 +908,46 @@ class TestAsset(AssetSetup):
 						"depreciation_expense_account": asset_category_account.depreciation_expense_account,
 					},
 				)
+
+	def test_make_asset_movement_fences_each_asset(self):
+		from erpnext.assets.doctype.asset.mapper import make_asset_movement
+
+		asset = create_asset(item_code="Macbook Pro", company="_Test Company")
+
+		def movement_kwargs(name):
+			return {"assets": [{"name": name}]}
+
+		outside = make_company_fenced_user(
+			"asset-fenced@example.com", ["Accounts Manager"], "_Test Company 1"
+		)
+		with as_user(outside):
+			assert_refused_for_names(
+				self, make_asset_movement, movement_kwargs, [asset.name], caller_supplied=True
+			)
+		inside = make_company_fenced_user("asset-fenced@example.com", ["Accounts Manager"], "_Test Company")
+		with as_user(inside):
+			movement = make_asset_movement([{"name": asset.name}])
+		self.assertEqual(movement["assets"][0]["asset"], asset.name)
+		system_manager = make_fenced_user("asset-sm@example.com", ["System Manager"])
+		with as_user(system_manager):
+			self.assertEqual(make_asset_movement([{"name": asset.name}])["assets"][0]["asset"], asset.name)
+
+	def test_get_values_from_purchase_doc_needs_read_on_the_purchase_doc(self):
+		from erpnext.assets.doctype.asset.asset import get_values_from_purchase_doc
+
+		pr = make_purchase_receipt(item_code="Macbook Pro", qty=1, rate=100000.0, location="Test Location")
+		pi = make_purchase_invoice(item_code="Macbook Pro", qty=1, rate=100000.0)
+
+		quality_manager = make_fenced_user("asset-qm@example.com", ["Quality Manager"])
+		accounts_user = make_fenced_user("asset-au@example.com", ["Accounts User"])
+		for doctype, name in (("Purchase Receipt", pr.name), ("Purchase Invoice", pi.name)):
+			with as_user(quality_manager):
+				with self.assertRaises(frappe.PermissionError):
+					get_values_from_purchase_doc(name, "Macbook Pro", doctype)
+			with as_user(accounts_user):
+				values = get_values_from_purchase_doc(name, "Macbook Pro", doctype)
+			self.assertEqual(values["company"], "_Test Company")
+			self.assertEqual(values["asset_quantity"], 1)
 
 
 class TestDepreciationMethods(AssetSetup):

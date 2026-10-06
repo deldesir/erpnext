@@ -19,6 +19,7 @@ from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
 	update_linked_doc,
 	validate_inter_company_party,
 )
+from erpnext.accounts.utils import pre_submit_validation
 from erpnext.controllers.selling_controller import SellingController
 from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
 	validate_against_blanket_order,
@@ -252,7 +253,6 @@ class SalesOrder(SellingController):
 		self.validate_warehouse()
 		self.validate_drop_ship()
 		SalesOrderStockReservation(self).validate_reserved_stock()
-		self.validate_serial_no_based_delivery()
 		validate_against_blanket_order(self)
 		validate_inter_company_party(
 			self.doctype, self.customer, self.company, self.inter_company_order_reference
@@ -275,6 +275,7 @@ class SalesOrder(SellingController):
 		StatusService(self).set_default_statuses()
 
 		self.reset_default_field_value("set_warehouse", "items", "warehouse")
+		pre_submit_validation(self, check_credit_limit=True)
 
 	def set_has_unit_price_items(self):
 		"""
@@ -503,6 +504,12 @@ class SalesOrder(SellingController):
 				if doc.docstatus.is_cancelled():
 					frappe.throw(_("Quotation {0} is cancelled").format(quotation))
 
+				if flag == "submit" and doc.status == "Lost":
+					frappe.throw(_("Quotation {0} is Lost").format(quotation))
+
+				if flag == "submit" and not doc.is_active:
+					frappe.throw(_("Quotation {0} is inactive").format(quotation))
+
 				doc.set_status(update=True)
 				doc.update_opportunity("Converted" if flag == "submit" else "Quotation")
 
@@ -693,41 +700,6 @@ class SalesOrder(SellingController):
 					reference_delivery_date, reference_doc.transaction_date, self.transaction_date
 				),
 			)
-
-	def validate_serial_no_based_delivery(self):
-		reserved_items = []
-		normal_items = []
-		for item in self.items:
-			if item.ensure_delivery_based_on_produced_serial_no:
-				if item.item_code in normal_items:
-					frappe.throw(
-						_(
-							"Cannot ensure delivery by Serial No as Item {0} is added with and without Ensure Delivery by Serial No."
-						).format(item.item_code)
-					)
-				if item.item_code not in reserved_items:
-					if not frappe.get_cached_value("Item", item.item_code, "has_serial_no"):
-						frappe.throw(
-							_(
-								"Item {0} has no Serial No. Only serialized items can have delivery based on Serial No"
-							).format(item.item_code)
-						)
-					if not frappe.db.exists("BOM", {"item": item.item_code, "is_active": 1}):
-						frappe.throw(
-							_(
-								"No active BOM found for item {0}. Delivery by Serial No cannot be ensured"
-							).format(item.item_code)
-						)
-				reserved_items.append(item.item_code)
-			else:
-				normal_items.append(item.item_code)
-
-			if not item.ensure_delivery_based_on_produced_serial_no and item.item_code in reserved_items:
-				frappe.throw(
-					_(
-						"Cannot ensure delivery by Serial No as Item {0} is added with and without Ensure Delivery by Serial No."
-					).format(item.item_code)
-				)
 
 	@frappe.whitelist()
 	def has_unreserved_stock(self, table_name: str = "items") -> dict:
@@ -957,19 +929,41 @@ def get_stock_reservation_status():
 	return frappe.get_single_value("Stock Settings", "enable_stock_reservation")
 
 
+def get_credit_note_return_criterion(invoice):
+	"""Match return invoices that reverse both the delivery and the billing of Sales Order rows."""
+	return (
+		(invoice.is_return == 1)
+		& (invoice.update_stock == 1)
+		& (invoice.update_billed_amount_in_sales_order == 1)
+	)
+
+
 def get_pending_qty_criterion(sales_order_item):
 	"""Mirror the mapper's pending quantity check."""
+	invoice = qb.DocType("Sales Invoice")
 	invoice_item = qb.DocType("Sales Invoice Item")
 	billed_qty = (
 		qb.from_(invoice_item)
 		.select(IfNull(Sum(invoice_item.qty), 0))
 		.where((invoice_item.docstatus == 1) & (invoice_item.so_detail == sales_order_item.name))
 	)
+	credit_note_returned_qty = (
+		qb.from_(invoice_item)
+		.inner_join(invoice)
+		.on(invoice.name == invoice_item.parent)
+		.select(IfNull(Sum(-invoice_item.qty), 0))
+		.where(
+			(invoice_item.docstatus == 1)
+			& (invoice_item.so_detail == sales_order_item.name)
+			& get_credit_note_return_criterion(invoice)
+		)
+	)
+	returned_qty = sales_order_item.returned_qty - credit_note_returned_qty
 
 	qty_precision = frappe.get_precision("Sales Order Item", "qty")
 	has_unbilled_ordered_qty = Round(sales_order_item.qty - billed_qty, qty_precision) > 0
 	has_unbilled_delivered_qty = (
-		Round(sales_order_item.qty - sales_order_item.returned_qty - billed_qty, qty_precision) > 0
+		Round(sales_order_item.qty - returned_qty - billed_qty, qty_precision) > 0
 	) | (Round(sales_order_item.delivered_qty - billed_qty, qty_precision) > 0)
 
 	return has_unbilled_ordered_qty & has_unbilled_delivered_qty
