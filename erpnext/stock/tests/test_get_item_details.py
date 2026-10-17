@@ -1,6 +1,7 @@
 import frappe
+from frappe.utils import today
 
-from erpnext.stock.get_item_details import get_item_details
+from erpnext.stock.get_item_details import get_item_details, get_price_list_currency_and_exchange_rate
 from erpnext.tests.utils import ERPNextTestSuite
 
 
@@ -652,3 +653,108 @@ class TestGetItemDetail(ERPNextTestSuite):
 		):
 			self.assertEqual(self.get_picked_batch_no(item_code, 5, items=box_row), batches[0])
 			self.assertIsNone(self.get_picked_batch_no(item_code, 6, items=box_row))
+
+	def test_price_not_uom_dependent_is_applied_to_item_rows(self):
+		"""An Item Price saved for the stock UOM is scaled to the row UOM unless the Price List
+		is marked Price Not UOM Dependent."""
+		item_code = self.make_multi_uom_item()
+		price_list = self.make_selling_price_list("_Test UOM Price List")
+		self.make_item_price(item_code, price_list.name, 100)
+
+		for not_uom_dependent, expected_rate in ((0, 1000), (1, 100)):
+			with self.subTest(price_not_uom_dependent=not_uom_dependent):
+				price_list.price_not_uom_dependent = not_uom_dependent
+				price_list.save()
+				details = get_item_details(self.get_uom_rate_context(item_code, price_list.name))
+				self.assertEqual(details.price_list_rate, expected_rate)
+
+	def test_fallback_price_list_uses_its_own_uom_setting(self):
+		item_code = self.make_multi_uom_item()
+		selected_list = self.make_selling_price_list("_Test UOM Price List", not_uom_dependent=1)
+		default_list = self.make_selling_price_list("_Test UOM Default Price List", not_uom_dependent=0)
+		self.make_item_price(item_code, default_list.name, 100)
+
+		with self.change_settings(
+			"Selling Settings",
+			{"fallback_to_default_price_list": 1, "selling_price_list": default_list.name},
+		):
+			details = get_item_details(self.get_uom_rate_context(item_code, selected_list.name))
+
+		self.assertEqual(details.price_list_rate, 1000)
+
+	def test_supplier_quotation_uses_buying_price_list_exchange_rate(self):
+		for exchange_rate, for_buying in ((90, 1), (95, 0)):
+			frappe.get_doc(
+				{
+					"doctype": "Currency Exchange",
+					"date": today(),
+					"from_currency": "EUR",
+					"to_currency": "INR",
+					"exchange_rate": exchange_rate,
+					"for_buying": for_buying,
+					"for_selling": not for_buying,
+				}
+			).insert()
+		price_list = frappe.get_doc(
+			{"doctype": "Price List", "price_list_name": "_Test EUR Buying", "currency": "EUR", "buying": 1}
+		).insert()
+
+		details = get_price_list_currency_and_exchange_rate(
+			frappe._dict(
+				doctype="Supplier Quotation",
+				price_list=price_list.name,
+				company="_Test Company",
+				transaction_date=today(),
+			)
+		)
+
+		self.assertEqual(details.plc_conversion_rate, 90)
+
+	def make_multi_uom_item(self) -> str:
+		from erpnext.stock.doctype.item.test_item import make_item
+
+		return make_item(
+			properties={
+				"stock_uom": "_Test UOM",
+				"uoms": [
+					{"uom": "_Test UOM", "conversion_factor": 1},
+					{"uom": "_Test UOM 1", "conversion_factor": 10},
+				],
+			}
+		).name
+
+	def make_selling_price_list(self, name: str, not_uom_dependent: int = 0):
+		price_list = frappe.get_doc(
+			{"doctype": "Price List", "price_list_name": name, "currency": "INR", "selling": 1}
+		).insert(ignore_if_duplicate=True)
+		price_list.price_not_uom_dependent = not_uom_dependent
+		return price_list.save()
+
+	def make_item_price(self, item_code: str, price_list: str, rate: float) -> None:
+		frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": price_list,
+				"price_list_rate": rate,
+			}
+		).insert()
+
+	def get_uom_rate_context(self, item_code: str, price_list: str) -> frappe._dict:
+		return frappe._dict(
+			{
+				"item_code": item_code,
+				"company": "_Test Company",
+				"customer": "_Test Customer",
+				"currency": "INR",
+				"conversion_rate": 1.0,
+				"price_list": price_list,
+				"price_list_currency": "INR",
+				"plc_conversion_rate": 1.0,
+				"doctype": "Sales Order",
+				"uom": "_Test UOM 1",
+				"conversion_factor": 10,
+				"ignore_pricing_rule": 1,
+				"qty": 1,
+			}
+		)

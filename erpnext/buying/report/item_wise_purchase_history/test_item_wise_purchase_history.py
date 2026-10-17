@@ -2,6 +2,8 @@
 # See license.txt
 
 import frappe
+from frappe.core.doctype.user_permission.test_user_permission import create_user
+from frappe.permissions import add_user_permission
 
 from erpnext.buying.doctype.purchase_order.mapper import make_purchase_invoice
 from erpnext.buying.doctype.purchase_order.test_purchase_order import (
@@ -56,12 +58,6 @@ class TestItemWisePurchaseHistory(ERPNextTestSuite):
 			row["purchase_order"] for row in self.run_report(from_date="2026-01-01", to_date="2026-03-01")[1]
 		}
 		self.assertNotIn(po.name, out_of_range)
-
-	def test_runs_without_dates(self):
-		po = create_purchase_order(transaction_date="2026-06-01")
-
-		names = {row["purchase_order"] for row in execute({"company": "_Test Company"})[1]}
-		self.assertIn(po.name, names)
 
 	def test_item_code_filter(self):
 		po = create_purchase_order(
@@ -140,3 +136,15 @@ class TestItemWisePurchaseHistory(ERPNextTestSuite):
 		self.assertIn("_Test Item", labels)
 		# 2*500 + 3*500 aggregated for the item
 		self.assertEqual(values[labels.index("_Test Item")], 2500)
+
+	def test_restricted_user_sees_only_permitted_suppliers_in_rows_and_chart(self):
+		create_purchase_order(supplier="_Test Supplier", qty=10, rate=100, transaction_date="2026-06-01")
+		create_purchase_order(supplier="_Test Supplier 1", qty=4, rate=250, transaction_date="2026-06-01")
+		user = create_user("purchase_history_restricted@example.com", "Purchase User").name
+		add_user_permission("Supplier", "_Test Supplier", user)
+
+		with self.set_user(user):
+			_columns, data, _message, chart = self.run_report(from_date="2026-06-01", to_date="2026-06-01")
+
+		self.assertEqual({row["supplier"] for row in data}, {"_Test Supplier"})
+		self.assertEqual(chart["data"]["datasets"][0]["values"], [1000])

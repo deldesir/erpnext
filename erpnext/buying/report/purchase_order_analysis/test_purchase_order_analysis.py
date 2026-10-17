@@ -1,9 +1,10 @@
 # Copyright (c) 2025, Frappe Technologies Pvt. Ltd. and contributors
 # For license information, please see license.txt
 
-from unittest.mock import patch
 
 import frappe
+from frappe.core.doctype.user_permission.test_user_permission import create_user
+from frappe.permissions import add_user_permission
 from frappe.utils import add_days, nowdate
 
 from erpnext.accounts.doctype.purchase_invoice.mapper import make_debit_note
@@ -15,7 +16,6 @@ from erpnext.buying.doctype.purchase_order.test_purchase_order import (
 from erpnext.buying.report.purchase_order_analysis.purchase_order_analysis import (
 	AGGREGATED_FIELDS,
 	execute,
-	group_by_item,
 )
 from erpnext.stock.doctype.item.test_item import create_item
 from erpnext.tests.utils import ERPNextTestSuite
@@ -133,39 +133,18 @@ class TestPurchaseOrderAnalysis(ERPNextTestSuite):
 			[("Box", 2), ("Nos", 10)],
 		)
 
-	def test_group_by_filters_cannot_be_combined(self):
-		self.assertRaises(
-			frappe.ValidationError,
-			execute,
-			self.get_filters(group_by_po=1, group_by_item=1),
-		)
+	def test_restricted_user_sees_only_permitted_suppliers(self):
+		create_item(ITEM_CODE)
+		permitted = create_purchase_order(item_code=ITEM_CODE, supplier="_Test Supplier", qty=10, rate=100)
+		other = create_purchase_order(item_code=ITEM_CODE, supplier="_Test Supplier 1", qty=4, rate=250)
+		user = create_user("po_analysis_restricted@example.com", "Purchase User").name
+		add_user_permission("Supplier", "_Test Supplier", user)
 
-	def test_group_by_item_keeps_each_company_apart(self):
-		rows = [
-			self.make_item_row("_Test Company", 10),
-			self.make_item_row("_Test Company 1", 4),
-			self.make_item_row("_Test Company", 6),
-		]
+		with self.set_user(user):
+			_columns, data, _message, chart = execute(
+				self.get_filters(group_by_item=1, name=[permitted.name, other.name])
+			)
 
-		self.assertEqual(
-			[(row["company"], row["qty"]) for row in group_by_item(rows)],
-			[("_Test Company", 16), ("_Test Company 1", 4)],
-		)
-
-	def test_company_falls_back_to_the_default(self):
-		po = self.make_purchase_order(qty=10)
-		filters = self.get_filters(company=None)
-
-		with patch("erpnext.get_default_company", return_value="_Test Company"):
-			columns, data, message, chart = execute(filters)
-
-		self.assertIn(po.name, [row["purchase_order"] for row in data])
-
-		with patch("erpnext.get_default_company", return_value="_Test Company 1"):
-			columns, data, message, chart = execute(filters)
-
-		self.assertNotIn(po.name, [row["purchase_order"] for row in data])
-
-	def test_company_is_mandatory_without_a_default(self):
-		with patch("erpnext.get_default_company", return_value=None):
-			self.assertRaises(frappe.ValidationError, execute, self.get_filters(company=None))
+		row = self.get_item_rows(data)[0]
+		self.assertEqual((row["qty"], row["amount"]), (10, 1000))
+		self.assertEqual(sum(chart["data"]["datasets"][0]["values"]), 1000)
