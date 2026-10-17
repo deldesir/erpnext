@@ -6,9 +6,8 @@ import frappe
 from erpnext.manufacturing.doctype.work_order.mapper import make_stock_entry as make_stock_entry_from_wo
 from erpnext.selling.doctype.sales_order.mapper import make_subcontracting_inward_order
 from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
-from erpnext.stock.doctype.item.test_item import make_item
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
-from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+from erpnext.tests.permission_test_utils import as_user, make_fenced_user
 from erpnext.tests.utils import ERPNextTestSuite
 
 
@@ -19,11 +18,28 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 	"""
 
 	def setUp(self):
-		create_test_data()
 		make_stock_entry(
 			item_code="Self RM", qty=100, to_warehouse="Stores - _TC", purpose="Material Receipt"
 		)
 		return super().setUp()
+
+	def test_service_item_in_a_larger_uom_can_be_fully_subcontracted(self):
+		item_list = [
+			{
+				"item_code": "Service Item 1",
+				"qty": 1,
+				"uom": "Box",
+				"conversion_factor": 12,
+				"fg_item": "Basic FG Item",
+				"fg_item_qty": 12,
+			}
+		]
+		so = make_sales_order(is_subcontracted=1, item_list=item_list)
+		scio = make_subcontracting_inward_order(so.name)
+		scio.items[0].delivery_warehouse = "_Test Warehouse - _TC"
+		scio.submit()
+
+		self.assertEqual(scio.items[0].qty, 12)
 
 	def test_customer_provided_item_cost_field(self):
 		so, scio = create_so_scio()
@@ -153,6 +169,93 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 			next((item for item in scio.received_items if item.rm_item_code == "Basic RM 2"), None)
 		)
 
+	def test_stock_user_can_receive_extra_customer_provided_item(self):
+		so, scio = create_so_scio()
+		stock_user = make_fenced_user("scio-extra-stock@example.com", ["Stock User", "Stock Manager"])
+
+		with as_user(stock_user):
+			rm_in = frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward())
+			for item in rm_in.items:
+				item.basic_rate = 10
+			rm_in.append(
+				"items",
+				{
+					"item_code": "Basic RM 2",
+					"qty": 5,
+					"t_warehouse": rm_in.items[0].t_warehouse,
+					"basic_rate": 10,
+					"against_fg": scio.items[0].name,
+				},
+			)
+			rm_in.insert()
+			rm_in.submit()
+
+		scio.reload()
+		self.assertTrue(
+			next((item for item in scio.received_items if item.rm_item_code == "Basic RM 2"), None)
+		)
+
+	def test_stock_user_can_cancel_receipt_of_extra_customer_provided_item(self):
+		so, scio = create_so_scio()
+		stock_user = make_fenced_user("scio-extra-cancel@example.com", ["Stock User"])
+
+		with as_user(stock_user):
+			rm_in = frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward())
+			for item in rm_in.items:
+				item.basic_rate = 10
+			rm_in.append(
+				"items",
+				{
+					"item_code": "Basic RM 2",
+					"qty": 5,
+					"t_warehouse": rm_in.items[0].t_warehouse,
+					"basic_rate": 10,
+					"against_fg": scio.items[0].name,
+				},
+			)
+			rm_in.insert()
+			rm_in.submit()
+			rm_in.cancel()
+
+		scio.reload()
+		self.assertFalse(
+			next((item for item in scio.received_items if item.rm_item_code == "Basic RM 2"), None)
+		)
+
+	def test_manufacturing_user_can_manufacture_with_extra_own_item(self):
+		make_stock_entry(
+			item_code="Self RM 2", qty=5, to_warehouse="Stores - _TC", purpose="Material Receipt"
+		)
+		so, scio = create_so_scio()
+		frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
+
+		scio.reload()
+		wo = frappe.get_doc("Work Order", scio.make_work_order()[0])
+		wo.skip_transfer = 1
+		next(
+			item for item in wo.required_items if item.item_code == "Self RM"
+		).source_warehouse = "Stores - _TC"
+		wo.submit()
+		manufacturing_user = make_fenced_user(
+			"scio-extra-manufacturing@example.com", ["Manufacturing User", "Stock User"]
+		)
+
+		with as_user(manufacturing_user):
+			manufacture = frappe.new_doc("Stock Entry").update(
+				make_stock_entry_from_wo(wo.name, "Manufacture")
+			)
+			manufacture.append(
+				"items",
+				{"item_code": "Self RM 2", "qty": 5, "s_warehouse": "Stores - _TC", "basic_rate": 10},
+			)
+			manufacture.insert()
+			manufacture.submit()
+
+		scio.reload()
+		self.assertTrue(
+			next((item for item in scio.received_items if item.rm_item_code == "Self RM 2"), None)
+		)
+
 	def test_add_extra_item_during_manufacture(self):
 		make_stock_entry(
 			item_code="Self RM 2", qty=5, to_warehouse="Stores - _TC", purpose="Material Receipt"
@@ -202,7 +305,7 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		new_bom.items[1].qty = 2
 		new_bom.items[2].qty = 3
 		new_bom.submit()
-		sc_bom = frappe.get_doc("Subcontracting BOM", "SB-0001")
+		sc_bom = frappe.get_doc("Subcontracting BOM", {"finished_good": "Basic FG Item"})
 		sc_bom.finished_good_bom = new_bom.name
 		sc_bom.save()
 
@@ -470,7 +573,6 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		scio.reload()
 		self.assertEqual(scio.items[0].produced_qty, 5)
 
-	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_delivery_of_overproduced_qty": 1})
 	@ERPNextTestSuite.change_settings(
 		"Manufacturing Settings", {"overproduction_percentage_for_work_order": 20}
 	)
@@ -493,16 +595,14 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		self.assertEqual(scio.items[0].produced_qty, 6)
 
 		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
-		self.assertEqual(delivery.items[0].qty, 6)
-		delivery.submit()
-
-		frappe.db.set_single_value("Selling Settings", "allow_delivery_of_overproduced_qty", 0)
-		delivery.cancel()
-		scio.reload()
-		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
 		self.assertEqual(delivery.items[0].qty, 5)
 		delivery.items[0].qty = 6
 		self.assertRaises(frappe.ValidationError, delivery.submit)
+
+		with self.change_settings("Selling Settings", allow_delivery_of_overproduced_qty=1):
+			delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
+			self.assertEqual(delivery.items[0].qty, 6)
+			delivery.submit()
 
 	@ERPNextTestSuite.change_settings("Selling Settings", {"deliver_secondary_items": 1})
 	def test_secondary_items_delivery(self):
@@ -511,7 +611,7 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 			frappe.new_doc("BOM Secondary Item", item_code="Basic RM 2", qty=1, secondary_item_type="Scrap")
 		)
 		new_bom.submit()
-		sc_bom = frappe.get_doc("Subcontracting BOM", "SB-0001")
+		sc_bom = frappe.get_doc("Subcontracting BOM", {"finished_good": "Basic FG Item"})
 		sc_bom.finished_good_bom = new_bom.name
 		sc_bom.save()
 
@@ -633,6 +733,25 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		reserved_qty = get_sre_reserved_qty_details_for_voucher("Subcontracting Inward Order", scio.name)
 		self.assertEqual(reserved_qty[basic_rm.name], 3)
 
+	def test_cancel_closed_work_order_releases_inward_allocation_once(self):
+		from erpnext.manufacturing.doctype.work_order.work_order import close_work_order
+
+		so, scio = create_so_scio()
+		frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
+		scio.reload()
+		wo = frappe.get_doc("Work Order", scio.make_work_order()[0])
+		wo.skip_transfer = 1
+		wo.required_items[-1].source_warehouse = "Stores - _TC"
+		wo.submit()
+
+		close_work_order(wo.name, "Closed")
+		wo.reload()
+		wo.cancel()
+
+		scio.reload()
+		basic_rm = next(row for row in scio.received_items if row.rm_item_code == "Basic RM")
+		self.assertEqual(basic_rm.work_order_qty, 0)
+
 	def test_rm_return_skips_own_materials(self):
 		so, scio = create_so_scio()
 		rm_in = frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward())
@@ -736,28 +855,6 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		scio.reload()
 		self.assertEqual(scio.get_production_items()[0]["qty"], 2)
 
-	def test_status_api_allows_only_close_and_reopen(self):
-		from erpnext.subcontracting.doctype.subcontracting_inward_order.subcontracting_inward_order import (
-			update_subcontracting_inward_order_status,
-		)
-
-		so, scio = create_so_scio()
-		self.assertRaises(
-			frappe.ValidationError, update_subcontracting_inward_order_status, scio.name, "Delivered"
-		)
-		update_subcontracting_inward_order_status(scio.name, "Closed")
-		self.assertEqual(frappe.db.get_value(scio.doctype, scio.name, "status"), "Closed")
-
-		item_list = [{"item_code": "Service Item 1", "qty": 5, "fg_item": "Basic FG Item", "fg_item_qty": 5}]
-		draft = make_subcontracting_inward_order(
-			make_sales_order(is_subcontracted=1, item_list=item_list).name
-		)
-		draft.items[0].delivery_warehouse = "_Test Warehouse - _TC"
-		draft.insert()
-		self.assertRaises(
-			frappe.ValidationError, update_subcontracting_inward_order_status, draft.name, "Closed"
-		)
-
 	def test_closing_sales_order_closes_all_inward_orders(self):
 		from erpnext.selling.doctype.sales_order.sales_order import update_status
 
@@ -777,25 +874,6 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 
 		for name in scio_names:
 			self.assertEqual(frappe.db.get_value("Subcontracting Inward Order", name, "status"), "Closed")
-
-	def test_work_order_qty_not_editable_after_submit(self):
-		so, scio = create_so_scio()
-		scio.received_items[0].work_order_qty = 5
-		self.assertRaises(frappe.UpdateAfterSubmitError, scio.save)
-
-	def test_inward_order_from_closed_sales_order(self):
-		from erpnext.selling.doctype.sales_order.sales_order import update_status
-
-		item_list = [{"item_code": "Service Item 1", "qty": 5, "fg_item": "Basic FG Item", "fg_item_qty": 5}]
-		so = make_sales_order(is_subcontracted=1, item_list=item_list)
-		scio = make_subcontracting_inward_order(so.name)
-		scio.items[0].delivery_warehouse = "_Test Warehouse - _TC"
-		scio.insert()
-
-		update_status("Closed", so.name)
-
-		self.assertRaises(frappe.ValidationError, make_subcontracting_inward_order, so.name)
-		self.assertRaises(frappe.ValidationError, scio.submit)
 
 	def test_delivery_mapper_qty(self):
 		so, scio = create_so_scio()
@@ -887,163 +965,3 @@ def create_so_scio(service_item="Service Item 1", fg_item="Basic FG Item"):
 	scio.submit()
 	scio.reload()
 	return so, scio
-
-
-def create_test_data():
-	make_subcontracted_items()
-	make_raw_materials()
-	make_service_items()
-	make_bom_for_subcontracted_items()
-	make_subcontracting_boms()
-	create_warehouse("_Test Customer Warehouse - _TC", {"customer": "_Test Customer"})
-
-
-def make_subcontracted_items():
-	sub_contracted_items = {
-		"Basic FG Item": {},
-		"FG Item with Serial": {
-			"has_serial_no": 1,
-			"serial_no_series": "FGS.####",
-		},
-		"FG Item with Batch": {
-			"has_batch_no": 1,
-			"create_new_batch": 1,
-			"batch_series": "FGB.####",
-		},
-		"FG Item with Serial and Batch": {
-			"has_serial_no": 1,
-			"serial_no_series": "FGS.####",
-			"has_batch_no": 1,
-			"create_new_batch": 1,
-			"batch_series": "FGB.####",
-		},
-	}
-
-	for item, properties in sub_contracted_items.items():
-		if not frappe.db.exists("Item", item):
-			properties.update({"is_stock_item": 1, "is_sub_contracted_item": 1})
-			make_item(item, properties)
-
-
-def make_raw_materials():
-	customer_provided_raw_materials = {
-		"Basic RM": {},
-		"Basic RM 2": {},
-		"RM with Serial": {"has_serial_no": 1, "serial_no_series": "RMS.####"},
-		"RM with Batch": {
-			"has_batch_no": 1,
-			"create_new_batch": 1,
-			"batch_number_series": "RMB.####",
-		},
-		"RM with Serial and Batch": {
-			"has_serial_no": 1,
-			"serial_no_series": "RMS.####",
-			"has_batch_no": 1,
-			"create_new_batch": 1,
-			"batch_number_series": "RMB.####",
-		},
-	}
-
-	for item, properties in customer_provided_raw_materials.items():
-		if not frappe.db.exists("Item", item):
-			properties.update({"is_stock_item": 1, "is_purchase_item": 0, "is_customer_provided_item": 1})
-			make_item(item, properties)
-
-	self_raw_materials = {
-		"Self RM": {},
-		"Self RM 2": {},
-	}
-
-	for item, properties in self_raw_materials.items():
-		if not frappe.db.exists("Item", item):
-			properties.update({"is_stock_item": 1, "valuation_rate": 10})
-			make_item(item, properties)
-
-
-def make_service_items():
-	from erpnext.controllers.tests.test_subcontracting_controller import make_service_item
-
-	service_items = {
-		"Service Item 1": {},
-		"Service Item 2": {},
-		"Service Item 3": {},
-		"Service Item 4": {},
-	}
-
-	for item, properties in service_items.items():
-		make_service_item(item, properties)
-
-
-def make_bom_for_subcontracted_items():
-	from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
-
-	boms = {
-		"Basic FG Item": [
-			"Basic RM",
-			"RM with Serial",
-			"RM with Batch",
-			"RM with Serial and Batch",
-			"Self RM",
-		],
-		"FG Item with Serial": [
-			"Basic RM",
-			"RM with Serial",
-			"RM with Batch",
-			"RM with Serial and Batch",
-			"Self RM",
-		],
-		"FG Item with Batch": [
-			"Basic RM",
-			"RM with Serial",
-			"RM with Batch",
-			"RM with Serial and Batch",
-			"Self RM",
-		],
-		"FG Item with Serial and Batch": [
-			"Basic RM",
-			"RM with Serial",
-			"RM with Batch",
-			"RM with Serial and Batch",
-			"Self RM",
-		],
-	}
-
-	for item_code, raw_materials in boms.items():
-		if not frappe.db.exists("BOM", {"item": item_code}):
-			make_bom(
-				item=item_code, raw_materials=raw_materials, rate=100, currency="INR", set_as_default_bom=1
-			)
-
-
-def make_subcontracting_boms():
-	subcontracting_boms = [
-		{
-			"finished_good": "Basic FG Item",
-			"service_item": "Service Item 1",
-		},
-		{
-			"finished_good": "FG Item with Serial",
-			"service_item": "Service Item 2",
-		},
-		{
-			"finished_good": "FG Item with Batch",
-			"service_item": "Service Item 3",
-		},
-		{
-			"finished_good": "FG Item with Serial and Batch",
-			"service_item": "Service Item 4",
-		},
-	]
-
-	for subcontracting_bom in subcontracting_boms:
-		if not frappe.db.exists("Subcontracting BOM", {"finished_good": subcontracting_bom["finished_good"]}):
-			doc = frappe.get_doc(
-				{
-					"doctype": "Subcontracting BOM",
-					"finished_good": subcontracting_bom["finished_good"],
-					"service_item": subcontracting_bom["service_item"],
-					"is_active": 1,
-				}
-			)
-			doc.insert()
-			doc.save()

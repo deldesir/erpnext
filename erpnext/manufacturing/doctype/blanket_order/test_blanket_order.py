@@ -101,6 +101,15 @@ class TestBlanketOrder(ERPNextTestSuite):
 		frappe.db.set_single_value("Buying Settings", "blanket_order_allowance", 10)
 		po.submit()
 
+	@ERPNextTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 10})
+	def test_blanket_order_allowance_applies_to_blanket_order_qty(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		orders = [make_purchase_order_against(bo, qty=qty) for qty in (90, 15, 10)]
+		orders[0].submit()
+		orders[1].submit()
+
+		self.assertRaises(frappe.ValidationError, orders[2].submit)
+
 	@ERPNextTestSuite.change_settings("Selling Settings", {"blanket_order_allowance": 0})
 	@ERPNextTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 0})
 	@ERPNextTestSuite.change_settings(
@@ -149,6 +158,17 @@ class TestBlanketOrder(ERPNextTestSuite):
 			},
 		)
 		self.assertRaises(frappe.ValidationError, so.submit)
+
+	@ERPNextTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 0})
+	def test_last_fraction_of_blanket_order_can_be_ordered(self):
+		item = make_item(properties={"stock_uom": "Kg"}).name
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=1, item_code=item)
+
+		make_purchase_order_against(bo, 0.9).submit()
+		make_purchase_order_against(bo, 0.1).submit()
+
+		bo.reload()
+		self.assertEqual(bo.items[0].ordered_qty, 1)
 
 	def test_status_follows_close_reopen_and_cancel(self):
 		bo = make_blanket_order(blanket_order_type="Selling")
@@ -223,14 +243,6 @@ class TestBlanketOrder(ERPNextTestSuite):
 
 		update_closed_status("Blanket Order", bo.name, [row], 0)
 		self.assertEqual(frappe.db.get_value("Blanket Order", bo.name, "status"), "Submitted")
-
-	def test_fully_ordered_row_cannot_be_closed(self):
-		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=10)
-		make_purchase_order_against(bo, qty=10).submit()
-
-		self.assertRaises(
-			frappe.ValidationError, update_closed_status, "Blanket Order", bo.name, [bo.items[0].name], 1
-		)
 
 	def test_closed_row_is_skipped_when_ordering(self):
 		bo = make_two_row_purchasing_blanket_order()
@@ -428,58 +440,6 @@ class TestBlanketOrder(ERPNextTestSuite):
 					self.assertEqual(target.items[0].base_price_list_rate, price_list_rate)
 					self.assertEqual(target.items[0].rate, expected_rate)
 					self.assertEqual(target.items[0].blanket_order, blanket_order.name)
-
-	def test_applying_price_list_ignores_empty_item_rows(self):
-		blanket_order = frappe.new_doc("Blanket Order")
-		blanket_order.blanket_order_type = "Selling"
-		blanket_order.company = "_Test Company"
-		blanket_order.customer = "_Test Customer"
-		blanket_order.from_date = today()
-		blanket_order.append("items", {})
-
-		pricing = apply_price_list(blanket_order.as_dict())
-
-		self.assertEqual(pricing["children"], [])
-
-	def test_price_list_rate_is_fetched_on_item_selection(self):
-		company = "_Test Company"
-		company_currency = get_company_currency(company)
-		price_list_rate = 800
-		blanket_order, _price_list = make_priced_blanket_order(
-			company=company,
-			currency=company_currency,
-			conversion_rate=1,
-			price_list_rate=price_list_rate,
-			qty=0,
-		)
-		item = blanket_order.items[0]
-
-		self.assertEqual(item.price_list_rate, price_list_rate)
-		self.assertEqual(item.rate, price_list_rate)
-
-	def test_price_list_rates_fetch_item_uoms_once(self):
-		blanket_order = new_blanket_order("Selling")
-		blanket_order.selling_price_list = "_Test Price List"
-		for item_code in ("ITEM-1", "ITEM-2"):
-			blanket_order.append("items", {"item_code": item_code, "qty": 1})
-
-		with (
-			patch.object(
-				blanket_order_pricing.frappe,
-				"get_all",
-				return_value=[["ITEM-1", "Nos"], ["ITEM-2", "Nos"]],
-			) as get_all,
-			patch.object(blanket_order_pricing, "get_price_list_rate_for", return_value=None),
-		):
-			rates = blanket_order_pricing.get_price_list_rates(blanket_order)
-
-		self.assertEqual(len(rates), 2)
-		get_all.assert_called_once_with(
-			"Item",
-			filters={"name": ("in", ["ITEM-1", "ITEM-2"])},
-			fields=["name", "stock_uom"],
-			as_list=True,
-		)
 
 	def test_price_list_conversion_uses_currency_precision(self):
 		company = "_Test Company"

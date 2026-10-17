@@ -11,7 +11,7 @@ are called from other modules.
 import frappe
 from dateutil.relativedelta import relativedelta
 from frappe import _
-from frappe.query_builder.functions import CombineDatetime
+from frappe.query_builder.functions import CombineDatetime, Max, Min
 from frappe.utils import (
 	cint,
 	date_diff,
@@ -23,6 +23,7 @@ from frappe.utils import (
 )
 
 from erpnext.manufacturing.doctype.manufacturing_settings.manufacturing_settings import (
+	get_capacity_planning_days,
 	get_mins_between_operations,
 )
 from erpnext.manufacturing.doctype.work_order.mapper import (
@@ -91,7 +92,7 @@ class OperationsService:
 		manufacturing_settings_doc = frappe.get_doc("Manufacturing Settings")
 
 		enable_capacity_planning = not cint(manufacturing_settings_doc.disable_capacity_planning)
-		plan_days = cint(manufacturing_settings_doc.capacity_planning_for_days) or 30
+		plan_days = get_capacity_planning_days()
 
 		for idx, row in enumerate(self.doc.operations):
 			qty = self.doc.qty
@@ -139,6 +140,9 @@ class OperationsService:
 		if sum(1 for d in self.doc.operations if d.operation == row.operation) > 1:
 			return []
 
+		if flt(self.get_scheduled_plan_row_qty(plan_row)) != flt(self.doc.qty):
+			return []
+
 		return frappe.get_all(
 			"Production Plan Schedule",
 			filters={
@@ -149,6 +153,12 @@ class OperationsService:
 			fields=["from_time", "to_time", "duration_mins", "workstation"],
 			order_by="from_time",
 		)
+
+	def get_scheduled_plan_row_qty(self, plan_row):
+		if self.doc.production_plan_item:
+			return frappe.db.get_value("Production Plan Item", plan_row, "planned_qty", cache=True)
+
+		return frappe.db.get_value("Production Plan Sub Assembly Item", plan_row, "qty", cache=True)
 
 	def _validate_capacity_window(self, row, plan_days):
 		from erpnext.manufacturing.doctype.work_order.work_order import CapacityError
@@ -308,25 +318,33 @@ class OperationsService:
 
 		return holidays[holiday_list]
 
-	def update_operation_status(self):
+	def update_operation_status(self, operation_id=None):
+		for d in self.doc.get("operations"):
+			if d.name == operation_id:
+				self.validate_operation_overproduction(d)
+
+			d.status = self._operation_status(d)
+
+	def validate_operation_overproduction(self, d):
 		allowance_percentage = flt(
 			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order")
 		)
 		max_allowed_qty_for_wo = flt(self.doc.qty) + (allowance_percentage / 100 * flt(self.doc.qty))
 
-		for d in self.doc.get("operations"):
-			d.status = self._operation_status(d, max_allowed_qty_for_wo)
+		if self._operation_qty(d) > flt(max_allowed_qty_for_wo, d.precision("completed_qty")):
+			frappe.throw(_("Completed Qty cannot be greater than 'Qty to Manufacture'"))
 
-	def _operation_status(self, d, max_allowed_qty_for_wo):
-		precision = d.precision("completed_qty")
-		qty = flt(flt(d.completed_qty, precision) + flt(d.process_loss_qty, precision), precision)
+	def _operation_status(self, d):
+		qty = self._operation_qty(d)
 		if not qty:
 			return "Pending"
-		if qty < flt(self.doc.qty, precision):
+		if qty < flt(self.doc.qty, d.precision("completed_qty")):
 			return "Work in Progress"
-		if qty <= flt(max_allowed_qty_for_wo, precision):
-			return "Completed"
-		frappe.throw(_("Completed Qty cannot be greater than 'Qty to Manufacture'"))
+		return "Completed"
+
+	def _operation_qty(self, d):
+		precision = d.precision("completed_qty")
+		return flt(flt(d.completed_qty, precision) + flt(d.process_loss_qty, precision), precision)
 
 	def set_actual_dates(self):
 		if self.doc.get("operations"):
@@ -350,22 +368,23 @@ class OperationsService:
 		# {"TIMESTAMP": [...]} renders MySQL's TIMESTAMP(date, time), invalid on postgres; use the
 		# portable CombineDatetime via query builder instead.
 		se = frappe.qb.DocType("Stock Entry")
+		posting_datetime = CombineDatetime(se.posting_date, se.posting_time)
 		data = (
 			frappe.qb.from_(se)
-			.select(CombineDatetime(se.posting_date, se.posting_time).as_("posting_datetime"))
+			.select(Min(posting_datetime).as_("start_date"), Max(posting_datetime).as_("end_date"))
 			.where(
 				(se.work_order == self.doc.name)
+				& (se.docstatus == 1)
 				& (se.purpose.isin(["Material Transfer for Manufacture", "Manufacture"]))
 			)
 			.run(as_dict=True)
 		)
-		if not data:
-			return
-
-		dates = [d.posting_datetime for d in data]
-		self.doc.db_set("actual_start_date", min(dates))
-		if self.doc.status == "Completed":
-			self.doc.db_set("actual_end_date", max(dates))
+		self.doc.db_set(
+			{
+				"actual_start_date": data[0].start_date,
+				"actual_end_date": data[0].end_date if self.doc.status == "Completed" else None,
+			}
+		)
 
 	def set_lead_time(self):
 		if self.doc.actual_start_date and self.doc.actual_end_date:

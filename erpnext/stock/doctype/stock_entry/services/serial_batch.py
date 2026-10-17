@@ -21,6 +21,7 @@ class StockEntrySABB(BaseStockEntry):
 
 		serial_nos, batch_nos = self.get_serial_batch_fields_for_subcontracting_inward()
 		already_picked_serial_nos = []
+		already_picked_batches = frappe._dict()
 
 		for row in self.doc.items:
 			if row.use_serial_batch_fields or not row.s_warehouse:
@@ -29,18 +30,28 @@ class StockEntrySABB(BaseStockEntry):
 				continue
 
 			bundle_doc = self._create_or_update_bundle_for_row(
-				row, serial_nos, batch_nos, already_picked_serial_nos
+				row, serial_nos, batch_nos, already_picked_serial_nos, already_picked_batches
 			)
 			if not bundle_doc:
 				continue
 
-			for entry in bundle_doc.entries:
-				if entry.serial_no:
-					already_picked_serial_nos.append(entry.serial_no)
-
+			self.add_picked_entries(bundle_doc, already_picked_serial_nos, already_picked_batches)
 			row.serial_and_batch_bundle = bundle_doc.name
 
-	def _create_or_update_bundle_for_row(self, row, serial_nos, batch_nos, already_picked_serial_nos):
+	def add_picked_entries(self, bundle_doc, already_picked_serial_nos, already_picked_batches):
+		for entry in bundle_doc.entries:
+			if entry.serial_no:
+				already_picked_serial_nos.append(entry.serial_no)
+			if entry.batch_no:
+				key = (entry.batch_no, bundle_doc.warehouse)
+				picked = already_picked_batches.setdefault(
+					key, frappe._dict(batch_no=entry.batch_no, warehouse=bundle_doc.warehouse, qty=0)
+				)
+				picked.qty += entry.qty
+
+	def _create_or_update_bundle_for_row(
+		self, row, serial_nos, batch_nos, already_picked_serial_nos, already_picked_batches
+	):
 		if row.serial_and_batch_bundle and abs(row.transfer_qty) != abs(
 			frappe.get_cached_value("Serial and Batch Bundle", row.serial_and_batch_bundle, "total_qty")
 		):
@@ -51,6 +62,7 @@ class StockEntrySABB(BaseStockEntry):
 					"serial_and_batch_bundle": row.serial_and_batch_bundle,
 					"type_of_transaction": "Outward",
 					"ignore_serial_nos": already_picked_serial_nos,
+					"already_picked_batches": already_picked_batches,
 					"qty": row.transfer_qty * -1,
 				}
 			).update_serial_and_batch_entries(
@@ -69,6 +81,7 @@ class StockEntrySABB(BaseStockEntry):
 					"voucher_detail_no": row.name,
 					"qty": row.transfer_qty * -1,
 					"ignore_serial_nos": already_picked_serial_nos,
+					"already_picked_batches": already_picked_batches,
 					"type_of_transaction": "Outward",
 					"company": self.doc.company,
 					"do_not_submit": True,
@@ -341,10 +354,18 @@ def get_batchwise_serial_nos(item_code, row):
 
 @frappe.whitelist()
 def get_expired_batch_items():
+	frappe.has_permission("Batch", "read", throw=True)
 	expired_batches = get_expired_batches()
 	if not expired_batches:
 		return []
-	return _enrich_expired_batches_with_stock(expired_batches)
+
+	rows = _enrich_expired_batches_with_stock(expired_batches)
+	permitted_warehouses = set(
+		frappe.get_list(
+			"Warehouse", filters={"name": ("in", list({row.warehouse for row in rows}))}, pluck="name"
+		)
+	)
+	return [row for row in rows if row.warehouse in permitted_warehouses]
 
 
 def _enrich_expired_batches_with_stock(expired_batches):
@@ -359,13 +380,12 @@ def _enrich_expired_batches_with_stock(expired_batches):
 
 
 def get_expired_batches():
-	batch = frappe.qb.DocType("Batch")
-
-	data = (
-		frappe.qb.from_(batch)
-		.select(batch.item, batch.name.as_("batch_no"), batch.stock_uom)
-		.where((batch.expiry_date <= nowdate()) & (batch.expiry_date.isnotnull()))
-	).run(as_dict=True)
+	data = frappe.get_list(
+		"Batch",
+		filters=[["expiry_date", "<", nowdate()], ["expiry_date", "is", "set"]],
+		fields=["item", "name as batch_no", "stock_uom"],
+		limit_page_length=0,
+	)
 
 	if not data:
 		return []

@@ -233,9 +233,18 @@ class SalesOrder(SellingController):
 				"has_potentially_billable_items",
 				has_potentially_billable_items(self.name),
 			)
+			self.set_onload("has_over_deliverable_rows", self.has_over_deliverable_rows())
 
 	def can_update_items(self) -> bool:
 		return SubcontractingService(self).can_update_items()
+
+	def has_over_deliverable_rows(self) -> bool:
+		"""Return True if a fully delivered row can take more qty within its over delivery allowance."""
+		return any(
+			flt(item.qty) <= flt(item.delivered_qty) < flt(item.max_deliverable_qty, item.precision("qty"))
+			for item in self.items
+			if not (item.delivered_by_supplier or cint(item.skip_delivery) or item.closed)
+		)
 
 	def before_validate(self):
 		self.set_has_unit_price_items()
@@ -671,6 +680,8 @@ class SalesOrder(SellingController):
 		StatusService(self).set_indicator()
 
 	def on_recurring(self, reference_doc, auto_repeat_doc):
+		super().on_recurring(reference_doc, auto_repeat_doc)
+
 		def _get_delivery_date(ref_doc_delivery_date, red_doc_transaction_date, transaction_date):
 			delivery_date = auto_repeat_doc.get_next_schedule_date(schedule_date=ref_doc_delivery_date)
 
@@ -863,6 +874,7 @@ def get_work_order_items(sales_order: str, for_raw_material_request: int = 0):
 	"""Returns items with BOM that already do not have a linked work order"""
 	if sales_order:
 		so = frappe.get_doc("Sales Order", sales_order)
+		so.check_permission("read")
 
 		wo = qb.DocType("Work Order")
 
@@ -938,15 +950,20 @@ def get_credit_note_return_criterion(invoice):
 	)
 
 
-def get_pending_qty_criterion(sales_order_item):
-	"""Mirror the mapper's pending quantity check."""
-	invoice = qb.DocType("Sales Invoice")
+def get_billed_qty_query(sales_order_item):
+	"""Return the qty billed against a Sales Order Item by submitted Sales Invoices."""
 	invoice_item = qb.DocType("Sales Invoice Item")
-	billed_qty = (
+	return (
 		qb.from_(invoice_item)
 		.select(IfNull(Sum(invoice_item.qty), 0))
 		.where((invoice_item.docstatus == 1) & (invoice_item.so_detail == sales_order_item.name))
 	)
+
+
+def get_pending_qty_criterion(sales_order_item, billed_qty):
+	"""Mirror the mapper's pending quantity check."""
+	invoice = qb.DocType("Sales Invoice")
+	invoice_item = qb.DocType("Sales Invoice Item")
 	credit_note_returned_qty = (
 		qb.from_(invoice_item)
 		.inner_join(invoice)
@@ -969,6 +986,14 @@ def get_pending_qty_criterion(sales_order_item):
 	return has_unbilled_ordered_qty & has_unbilled_delivered_qty
 
 
+def get_qty_billed_below_amount_criterion(sales_order_item, billed_qty):
+	"""Mirror the mapper's check for a fully billed qty that is billed below the row amount."""
+	qty_precision = frappe.get_precision("Sales Order Item", "qty")
+	return (Round(sales_order_item.qty - billed_qty, qty_precision) <= 0) & (
+		Abs(sales_order_item.billed_amt) < Abs(sales_order_item.amount)
+	)
+
+
 def get_potentially_billable_item_criterion(sales_order, sales_order_item, item):
 	"""Return the row level checks the Sales Invoice mapper applies."""
 	global_allowance = flt(frappe.get_cached_value("Accounts Settings", None, "over_billing_allowance"))
@@ -980,8 +1005,10 @@ def get_potentially_billable_item_criterion(sales_order, sales_order_item, item)
 		Abs(sales_order_item.billed_amt) < Abs(sales_order_item.amount) * (1 + allowance / 100)
 	)
 	is_unit_price_row = (sales_order.has_unit_price_items == 1) & (sales_order_item.qty == 0)
-	is_billable_row = (
-		(sales_order_item.qty != 0) & has_amount_headroom & get_pending_qty_criterion(sales_order_item)
+	billed_qty = get_billed_qty_query(sales_order_item)
+	is_billable_row = (sales_order_item.qty != 0) & (
+		(has_amount_headroom & get_pending_qty_criterion(sales_order_item, billed_qty))
+		| get_qty_billed_below_amount_criterion(sales_order_item, billed_qty)
 	)
 
 	return (sales_order_item.closed == 0) & (is_unit_price_row | is_billable_row)
