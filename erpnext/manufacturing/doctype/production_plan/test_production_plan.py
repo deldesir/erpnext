@@ -59,6 +59,18 @@ class TestProductionPlan(ERPNextTestSuite):
 			if not frappe.db.get_value("BOM", {"item": item}):
 				make_bom(item=item, raw_materials=raw_materials)
 
+	def test_visualizer_counts_process_loss_as_done(self):
+		from erpnext.manufacturing.page.production_plan_visualizer.production_plan_visualizer import (
+			get_finished_goods,
+		)
+
+		plan = frappe._dict(
+			po_items=[frappe._dict(name="row", item_code="Test Production Item 1", planned_qty=10)],
+		)
+		work_orders = [frappe._dict(production_plan_item="row", qty=10, produced_qty=9, process_loss_qty=1)]
+
+		self.assertEqual(get_finished_goods(plan, work_orders)[0]["pending_qty"], 0)
+
 	def test_production_plan_mr_creation(self):
 		"Test if MRs are created for unavailable raw materials."
 		pln = create_production_plan(item_code="Test Production Item 1")
@@ -1765,6 +1777,36 @@ class TestProductionPlan(ERPNextTestSuite):
 		pln.get_so_items()
 		self.assertEqual(pln.po_items[0].item_code, "PIV-RED")
 		self.assertEqual(pln.po_items[0].bom_no, parent_bom.name)
+
+	def test_template_item_cannot_be_planned_but_variant_can_use_template_bom(self):
+		template = make_item(
+			"Test PP Template Item",
+			{
+				"is_stock_item": 1,
+				"has_variants": 1,
+				"attributes": [{"attribute": "Colour"}],
+			},
+		)
+		bom = make_bom(item=template.name, raw_materials=["Raw Material Item 1"])
+		plan = create_production_plan(
+			item_code=template.name,
+			skip_getting_mr_items=1,
+			do_not_save=1,
+		)
+		plan.po_items[0].bom_no = bom.name
+
+		with self.assertRaisesRegex(frappe.ValidationError, "Item Template"):
+			plan.insert()
+
+		variant = create_variant(template.name, {"Colour": "Red"}).insert()
+		plan = create_production_plan(
+			item_code=variant.name,
+			skip_getting_mr_items=1,
+			do_not_save=1,
+		)
+		plan.po_items[0].bom_no = bom.name
+		plan.insert()
+		plan.submit()
 
 	def test_get_sales_order_items_for_product_bundle(self):
 		"""Testing the Planned Qty for Product Bundle Item"""
