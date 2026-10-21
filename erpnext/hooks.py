@@ -63,8 +63,16 @@ web_include_icons = [
 
 doctype_js = {
 	"Address": "public/js/address.js",
-	"Customer": ["public/js/party_overview.js", "public/js/customer_overview.js"],
-	"Supplier": ["public/js/party_overview.js", "public/js/supplier_overview.js"],
+	"Customer": [
+		"public/js/party_overview.js",
+		"public/js/customer_overview.js",
+		"public/js/party_items.js",
+	],
+	"Supplier": [
+		"public/js/party_overview.js",
+		"public/js/supplier_overview.js",
+		"public/js/party_items.js",
+	],
 	"Sales Order": "public/js/sales_order_proforma.js",
 	"Communication": "public/js/communication.js",
 	"Event": "public/js/event.js",
@@ -340,6 +348,7 @@ has_upload_permission = {"Employee": "erpnext.setup.doctype.employee.employee.ha
 
 permission_query_conditions = {
 	"Asset Activity": "erpnext.assets.doctype.asset_activity.asset_activity.get_permission_query_conditions",
+	"Contract": "erpnext.crm.doctype.contract.contract.get_permission_query_conditions",
 	"Item": "erpnext.stock.doctype.company_restriction.company_restriction.get_permission_query_conditions",
 	"Customer": "erpnext.stock.doctype.company_restriction.company_restriction.get_permission_query_conditions",
 	"Supplier": "erpnext.stock.doctype.company_restriction.company_restriction.get_permission_query_conditions",
@@ -348,6 +357,7 @@ permission_query_conditions = {
 }
 
 has_permission = {
+	"Contract": "erpnext.crm.doctype.contract.contract.has_permission",
 	"Item": "erpnext.stock.doctype.company_restriction.company_restriction.has_permission",
 	"Customer": "erpnext.stock.doctype.company_restriction.company_restriction.has_permission",
 	"Supplier": "erpnext.stock.doctype.company_restriction.company_restriction.has_permission",
@@ -416,6 +426,7 @@ doc_events = {
 		"on_update": [
 			"erpnext.support.doctype.service_level_agreement.service_level_agreement.on_communication_update",
 			"erpnext.support.doctype.issue.issue.set_first_response_time",
+			"erpnext.support.doctype.issue.issue.reopen_issue_without_sla",
 		],
 		"after_insert": [
 			"erpnext.crm.utils.link_communications_with_prospect",
@@ -507,6 +518,7 @@ scheduler_events = {
 	},
 	"hourly": [
 		"erpnext.projects.doctype.project.project.hourly_reminder",
+		"erpnext.support.doctype.service_level_agreement.service_level_agreement.fail_overdue_agreements",
 	],
 	"hourly_long": [],
 	"hourly_maintenance": [
@@ -731,6 +743,7 @@ global_search_doctypes = {
 }
 
 ignore_links_on_delete = [
+	"Asset Activity",
 	"Tax Withholding Entry",
 ]
 
