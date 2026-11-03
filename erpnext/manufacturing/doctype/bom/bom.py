@@ -421,10 +421,10 @@ class BOM(WebsiteGenerator):
 
 		return [
 			_(
-				"{0}: has no raw materials. Choose an Output Item BOM, or open the step and click Add Raw Materials."
-			).format(self.get_step_label(row))
+				"{0} has no raw materials. Click Add Raw Materials for this step in the Steps section, or select a BOM for its output item {1}."
+			).format(self.get_step_label(row), bold(row.finished_good))
 			for row in self.operations
-			if not row.bom_no and row.idx not in steps_with_materials
+			if row.finished_good and not row.bom_no and row.idx not in steps_with_materials
 		]
 
 	def validate_batch_split_operations(self):
@@ -435,7 +435,7 @@ class BOM(WebsiteGenerator):
 			if not self.track_semi_finished_goods:
 				frappe.throw(
 					_(
-						"Row #{0}: Batch Split is only supported when 'Produce an Item at Each Operation' is enabled."
+						"Row #{0}: Batch Split is only supported when 'Produce Item per Operation' is enabled."
 					).format(row.idx)
 				)
 
@@ -548,9 +548,12 @@ class BOM(WebsiteGenerator):
 				own_cost += flt(item.cost)
 			total_secondary_items_per += flt(item.cost_allocation_per)
 
-		self.cost_allocation_per = flt(100 - total_secondary_items_per)
+		self.cost_allocation_per = flt(100 - total_secondary_items_per, self.precision("cost_allocation_per"))
 
-		self.cost_allocation = (self.raw_material_cost - own_cost) * (self.cost_allocation_per / 100)
+		self.cost_allocation = flt(
+			(self.raw_material_cost - own_cost) * self.cost_allocation_per / 100,
+			self.precision("cost_allocation"),
+		)
 
 	def validate_secondary_items_cost(self):
 		if flt(self.secondary_items_cost) > flt(self.raw_material_cost):
@@ -565,7 +568,7 @@ class BOM(WebsiteGenerator):
 		for item in self.secondary_items:
 			total_cost_allocation_per += flt(item.cost_allocation_per)
 
-		if total_cost_allocation_per != 100:
+		if flt(total_cost_allocation_per, self.precision("cost_allocation_per")) != 100:
 			frappe.throw(_("Cost allocation between finished goods and secondary items should equal 100%"))
 
 	def on_update_after_submit(self):
@@ -786,7 +789,7 @@ class BOM(WebsiteGenerator):
 		if self.track_semi_finished_goods:
 			frappe.throw(
 				_(
-					"'Set Component Quantities Based On Percentage' cannot be used together with 'Produce an Item at Each Operation', as the component rows are derived from the operation BOMs."
+					"'Set Component Quantities Based On Percentage' cannot be used together with 'Produce Item per Operation', as the component rows are derived from the operation BOMs."
 				),
 				title=_("Invalid Formulation"),
 			)

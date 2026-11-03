@@ -29,6 +29,7 @@ from erpnext.accounts.doctype.account.account import get_account_currency
 from erpnext.accounts.doctype.financial_report_template.financial_report_template import (
 	sync_financial_report_templates,
 )
+from erpnext.setup.doctype.terms_and_conditions.terms_and_conditions import validate_terms_and_conditions
 from erpnext.setup.setup_wizard.operations.taxes_setup import setup_taxes_and_charges
 from erpnext.stock.utils import check_pending_reposting
 
@@ -175,6 +176,9 @@ class Company(NestedSet):
 
 	def validate(self):
 		old_doc = self.get_doc_before_save()
+		for field, module in (("default_selling_terms", "selling"), ("default_buying_terms", "buying")):
+			if not old_doc or self.get(field) != old_doc.get(field):
+				validate_terms_and_conditions(self.get(field), module)
 		self.update_default_account = False
 		if self.is_new():
 			self.update_default_account = True
@@ -1066,13 +1070,25 @@ def update_transactions_annual_history(company, commit=False):
 
 
 def cache_companies_monthly_sales_history():
+	refresh_total_monthly_sales = _should_refresh_total_monthly_sales()
 	companies = [d["name"] for d in frappe.get_list("Company")]
 	for company in companies:
 		update_company_monthly_sales(company)
 		update_transactions_annual_history(company)
+		if refresh_total_monthly_sales:
+			update_company_current_month_sales(company)
 
 	if not frappe.in_test:
 		frappe.db.commit()
+
+
+def _should_refresh_total_monthly_sales():
+	# "Each Transaction" updates on submit; refresh the cached figure for the
+	# scheduled frequencies only ("Monthly" just on the 1st).
+	frequency = frappe.get_single_value("Selling Settings", "sales_update_frequency")
+	if frequency == "Monthly":
+		return frappe.utils.now_datetime().day == 1
+	return frequency == "Daily"
 
 
 @frappe.whitelist()
