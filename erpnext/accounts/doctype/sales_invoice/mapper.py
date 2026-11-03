@@ -231,6 +231,8 @@ def make_inter_company_transaction(doctype, source_name, target_doc=None):
 		if (source.get("serial_no") or source.get("batch_no")) and not source.get("serial_and_batch_bundle"):
 			target.use_serial_batch_fields = 1
 
+		clear_item_tax_template_of_other_company(target, details.get("company"))
+
 	item_field_map = {
 		"doctype": target_doctype + " Item",
 		"field_no_map": ["income_account", "expense_account", "cost_center", "warehouse"],
@@ -293,6 +295,14 @@ def make_inter_company_transaction(doctype, source_name, target_doc=None):
 		frappe.throw(message.format(target_doctype, doctype, target_doctype))
 
 	return doclist
+
+
+def clear_item_tax_template_of_other_company(item, company):
+	if (
+		item.get("item_tax_template")
+		and frappe.get_cached_value("Item Tax Template", item.item_tax_template, "company") != company
+	):
+		item.item_tax_template = None
 
 
 def _get_linked_address(address, link_doctype, link_name):
@@ -590,19 +600,29 @@ def create_invoice_discounting(source_name: str, target_doc: str | dict | Docume
 
 @frappe.whitelist()
 def create_dunning(
-	source_name: str, target_doc: str | dict | Document | None = None, ignore_permissions: bool = False
+	source_name: str,
+	target_doc: str | dict | Document | None = None,
+	args: str | dict | bool | None = None,
+	ignore_permissions: bool = False,
 ):
+	from erpnext.accounts.doctype.dunning.dunning import get_payment_schedule_outstanding
+
+	if isinstance(args, bool):
+		ignore_permissions = args
+		args = None
+
+	args = frappe.parse_json(args) or {}
+
 	def postprocess_dunning(source, target):
 		dunning_type = frappe.db.exists("Dunning Type", {"is_default": 1, "company": source.company})
 		if dunning_type:
 			dunning_type = frappe.get_doc("Dunning Type", dunning_type)
 			target.dunning_type = dunning_type.name
 			target.rate_of_interest = dunning_type.rate_of_interest
-			target.dunning_fee = dunning_type.dunning_fee
+			target.dunning_fee = flt(dunning_type.dunning_fee) / target.conversion_rate
 			target.income_account = dunning_type.income_account
 			target.cost_center = dunning_type.cost_center
 			target.language = source.language
-			target.get_dunning_letter_text()
 
 		# update outstanding from doc
 		if source.payment_schedule and len(source.payment_schedule) == 1:
@@ -618,7 +638,19 @@ def create_dunning(
 					else:
 						row.outstanding = source.get("outstanding_amount")
 
+		if len(source.payment_schedule) > 1 and source.party_account_currency == source.currency:
+			outstanding = get_payment_schedule_outstanding(source, source.payment_schedule)
+			for row in target.overdue_payments[:]:
+				if row.sales_invoice == source.name:
+					row.outstanding = outstanding[row.payment_schedule]
+					if flt(row.outstanding, row.precision("outstanding")) <= 0:
+						target.remove(row)
+
+		if not target.overdue_payments:
+			frappe.throw(_("There are no overdue payments to include in this Dunning."))
 		target.validate()
+		if dunning_type:
+			target.get_dunning_letter_text()
 
 	return get_mapped_doc(
 		from_doctype="Sales Invoice",
@@ -632,7 +664,11 @@ def create_dunning(
 			"Payment Schedule": {
 				"doctype": "Overdue Payment",
 				"field_map": {"name": "payment_schedule", "parent": "sales_invoice"},
-				"condition": lambda doc: doc.outstanding > 0 and getdate(doc.due_date) < getdate(),
+				"condition": lambda doc: (
+					doc.outstanding > 0
+					and getdate(doc.due_date) < getdate()
+					and (not args.get("filtered_children") or doc.name in args["filtered_children"])
+				),
 			},
 		},
 		postprocess=postprocess_dunning,

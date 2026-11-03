@@ -203,6 +203,7 @@ def validate_returned_bundle_components(doc, valid_items, already_returned_items
 	"""Hold the components of returned bundles to what is left of each delivered component."""
 	from erpnext.stock.doctype.packed_item.packed_item import (
 		get_bundle_version_for_row,
+		get_component_conversion_factor,
 		get_product_bundle_items_by_name,
 	)
 
@@ -221,7 +222,7 @@ def validate_returned_bundle_components(doc, valid_items, already_returned_items
 
 		bundle_key = (row.item_code, row.get("product_bundle"))
 		if bundle_key not in bundles:
-			bundles[bundle_key] = get_bundle_version_for_row(row)
+			bundles[bundle_key] = get_bundle_version_for_row(row, doc)
 		bundle = bundles[bundle_key]
 		if not bundle:
 			continue
@@ -239,7 +240,9 @@ def validate_returned_bundle_components(doc, valid_items, already_returned_items
 				component.item_code, frappe._dict(qty=0, stock_qty=0)
 			)
 			remaining = flt(ref.stock_qty) - flt(returned.stock_qty)
-			returned.stock_qty = flt(returned.stock_qty) + bundle_stock_qty * flt(component.qty)
+			# component.qty is in the bundle-row UOM; convert to stock qty, as packing does
+			component_stock_qty = flt(component.qty) * get_component_conversion_factor(component, None)
+			returned.stock_qty = flt(returned.stock_qty) + bundle_stock_qty * component_stock_qty
 			if flt(returned.stock_qty, row.precision("stock_qty")) > flt(
 				ref.stock_qty, row.precision("stock_qty")
 			):
@@ -690,8 +693,7 @@ def make_return_doc(doctype: str, source_name: str, target_doc=None, return_agai
 				doc.payment_schedule = []
 
 		if doc.get("is_return") and hasattr(doc, "packed_items"):
-			for d in doc.get("packed_items"):
-				d.qty = d.qty * -1
+			update_packed_items(doc)
 
 		if doc.get("discount_amount"):
 			doc.discount_amount = -1 * source.discount_amount
@@ -701,6 +703,17 @@ def make_return_doc(doctype: str, source_name: str, target_doc=None, return_agai
 			doc.supplier_warehouse = source.supplier_warehouse
 		else:
 			doc.run_method("calculate_taxes_and_totals")
+
+	def update_packed_items(doc):
+		# key each packed row to its bundle row by idx, as packing does on a new document,
+		# so packing keeps the row (and its warehouse) instead of rebuilding it
+		ref_field = "dn_detail" if doctype == "Delivery Note" else frappe.scrub(doctype) + "_item"
+		item_idx = {item.get(ref_field): item.idx for item in doc.get("items")}
+		for d in doc.get("packed_items"):
+			d.qty = d.qty * -1
+			d.parent_detail_docname = item_idx.get(d.parent_detail_docname)
+			if default_warehouse_for_sales_return:
+				d.warehouse = default_warehouse_for_sales_return
 
 	def update_item(source_doc, target_doc, source_parent):
 		target_doc.qty = -1 * source_doc.qty
@@ -910,6 +923,10 @@ def make_return_doc(doctype: str, source_name: str, target_doc=None, return_agai
 				"condition": item_condition,
 			},
 			"Payment Schedule": {"doctype": "Payment Schedule", "postprocess": update_terms},
+			"Packed Item": {
+				"doctype": "Packed Item",
+				"field_map": {"parent_detail_docname": "parent_detail_docname"},
+			},
 		},
 		target_doc,
 		set_missing_values,

@@ -21,7 +21,6 @@ from erpnext.manufacturing.doctype.production_plan.production_plan import (
 	get_items_for_material_requests,
 	get_sales_orders,
 )
-from erpnext.selling.doctype.product_bundle.product_bundle import get_active_product_bundle
 from erpnext.selling.doctype.sales_order.sales_order import get_credit_note_return_criterion
 from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 from erpnext.stock.doctype.item.item import get_item_defaults
@@ -32,7 +31,7 @@ from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry impor
 	get_sre_reserved_qty_details_for_voucher,
 	get_ssb_bundle_for_voucher,
 )
-from erpnext.stock.get_item_details import get_bin_details, get_price_list_rate
+from erpnext.stock.get_item_details import _get_bin_details, get_price_list_rate
 from erpnext.stock.serial_batch_identity import SerialBatchIdentity
 
 
@@ -75,28 +74,20 @@ def make_material_request(source_name: str, target_doc: str | dict | Document | 
 		)
 
 	def get_remaining_packed_item_qty(so_item):
-		delivered_qty = frappe.db.get_value(
-			"Sales Order Item", {"name": so_item.parent_detail_docname}, ["delivered_qty"]
+		parent = frappe.db.get_value(
+			"Sales Order Item",
+			so_item.parent_detail_docname,
+			["delivered_qty", "qty"],
+			as_dict=True,
 		)
-
-		bundle_name = get_active_product_bundle(so_item.parent_item)
-		bundle_item_qty = (
-			frappe.db.get_value(
-				"Product Bundle Item",
-				{"parent": bundle_name, "item_code": so_item.item_code},
-				["qty"],
-			)
-			if bundle_name
-			else None
-		)
+		# components per parent qty frozen on the row (delivered_qty is in the row's sales UOM),
+		# so a later bundle edit can't shift the pending qty
+		components_per_unit = flt(so_item.qty) / (flt(parent.qty) or 1)
 
 		return flt(
 			flt(so_item.qty)
 			- flt(requested_item_qty.get(so_item.name, {}).get("qty"))
-			- max(
-				flt(delivered_qty) * flt(bundle_item_qty),
-				0,
-			)
+			- max(flt(parent.delivered_qty) * components_per_unit, 0)
 		)
 
 	def update_item(source, target, source_parent):
@@ -108,7 +99,7 @@ def make_material_request(source_name: str, target_doc: str | dict | Document | 
 			else get_remaining_qty(source)
 		)
 		target.stock_qty = flt(target.qty) * flt(target.conversion_factor)
-		target.actual_qty = get_bin_details(
+		target.actual_qty = _get_bin_details(
 			target.item_code, target.warehouse, source_parent.company, True
 		).get("actual_qty", 0)
 
@@ -589,6 +580,9 @@ def make_sales_invoice(
 		if source_parent.project:
 			target.cost_center = frappe.db.get_value("Project", source_parent.project, "cost_center")
 		if target.item_code:
+			target.enable_deferred_revenue = frappe.get_cached_value(
+				"Item", target.item_code, "enable_deferred_revenue"
+			)
 			item = get_item_defaults(target.item_code, source_parent.company)
 			item_group = get_item_group_defaults(target.item_code, source_parent.company)
 			cost_center = item.get("selling_cost_center") or item_group.get("selling_cost_center")
@@ -837,16 +831,28 @@ def make_purchase_order(
 		if (
 			item.ordered_qty < item.stock_qty
 			and not is_product_bundle(item.item_code)
-			and items_to_map.get(item.item_code) == supplier
+			and item.name in items_to_map
+			and items_to_map[item.name] == supplier
 		):
 			return True
 
 		return False
 
-	items_to_map = {
-		item.get("item_code"): item.get("supplier") for item in selected_items if item.get("item_code")
-	}
-	item_codes = list(set(items_to_map.keys()))
+	sales_order = frappe.get_doc("Sales Order", source_name)
+	sales_order.check_permission("read")
+	items_to_map = {}
+	for item in selected_items:
+		filters = {"name": item.get("name")} if item.get("name") else {"item_code": item.get("item_code")}
+		rows = sales_order.get("items", filters)
+		if len(rows) != 1:
+			frappe.throw(
+				_("Select a valid Sales Order row for Item {0}.").format(
+					frappe.bold(item.get("item_code") or item.get("name"))
+				),
+				title=_("Invalid Item Selection"),
+			)
+		items_to_map[rows[0].name] = item.get("supplier")
+
 	suppliers = list(set(items_to_map.values()))
 
 	if not suppliers:
@@ -906,7 +912,8 @@ def make_purchase_order(
 						"pricing_rules",
 					],
 					"postprocess": update_item_for_packed_item,
-					"condition": lambda doc: doc.parent_item in item_codes
+					"condition": lambda doc, s=supplier: doc.parent_detail_docname in items_to_map
+					and items_to_map[doc.parent_detail_docname] == s
 					and flt(doc.ordered_qty) < flt(doc.qty)
 					and not is_bundle_of_closed_row(doc),
 				},
@@ -1075,15 +1082,28 @@ def make_inter_company_purchase_order(source_name: str, target_doc: str | dict |
 
 @frappe.whitelist()
 def create_pick_list(source_name: str, target_doc: str | dict | Document | None = None):
+	source_doc = frappe.get_doc("Sales Order", source_name)
+	so_items = {row.name: row for row in source_doc.items}
+
 	def validate_sales_order():
-		so = frappe.get_doc("Sales Order", source_name)
-		for item in so.items:
+		for item in source_doc.items:
 			if item.stock_reserved_qty > 0:
 				frappe.throw(
 					_(
 						"Cannot create a pick list for Sales Order {0} because it has reserved stock. Please unreserve the stock in order to create a pick list."
 					).format(frappe.bold(source_name))
 				)
+
+	def should_pick_packed_item(packed_item) -> bool:
+		# a bundle component is pickable only while its parent row is open, warehouse-delivered and has qty left
+		parent = so_items.get(packed_item.parent_detail_docname)
+		return bool(
+			parent
+			and not parent.closed
+			and parent.delivered_by_supplier != 1
+			and abs(parent.delivered_qty) < abs(parent.qty)
+			and flt(packed_item.qty) > 0
+		)
 
 	def update_item_quantity(source, target, source_parent) -> None:
 		picked_qty = flt(source.picked_qty) / (flt(source.conversion_factor) or 1)
@@ -1093,7 +1113,7 @@ def create_pick_list(source_name: str, target_doc: str | dict | Document | None 
 		target.stock_qty = qty_to_be_picked * flt(source.conversion_factor)
 
 		# update available qty
-		bin_details = get_bin_details(source.item_code, source.warehouse, source_parent.company)
+		bin_details = _get_bin_details(source.item_code, source.warehouse, source_parent.company)
 		target.actual_qty = bin_details.get("actual_qty")
 		target.company_total_stock = bin_details.get("company_total_stock")
 
@@ -1141,6 +1161,7 @@ def create_pick_list(source_name: str, target_doc: str | dict | Document | None 
 				},
 				"field_no_map": ["picked_qty"],
 				"postprocess": update_packed_item_qty,
+				"condition": should_pick_packed_item,
 			},
 		},
 		target_doc,

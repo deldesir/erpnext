@@ -8,15 +8,17 @@ import frappe
 from email_reply_parser import EmailReplyParser
 from frappe import _, qb
 from frappe.model.document import Document
-from frappe.query_builder import Case, Interval
-from frappe.query_builder.functions import Count, CurDate, Date, Locate, Lower, Sum, UnixTimestamp
+from frappe.query_builder import Case
+from frappe.query_builder.functions import Count, Date, Locate, Lower, Sum, UnixTimestamp
 from frappe.utils import (
 	add_days,
+	add_years,
 	create_batch,
 	flt,
 	get_datetime,
 	get_link_to_form,
 	get_time,
+	nowdate,
 	nowtime,
 	today,
 )
@@ -574,7 +576,7 @@ def get_timeline_data(doctype: str, name: str) -> dict[int, int]:
 		frappe.qb.from_(timesheet_detail)
 		.select(UnixTimestamp(Date(timesheet_detail.from_time)), Count("*"))
 		.where(timesheet_detail.project == name)
-		.where(timesheet_detail.from_time > CurDate() - Interval(years=1))
+		.where(timesheet_detail.from_time > add_years(nowdate(), -1))
 		.where(timesheet_detail.docstatus < 2)
 		.groupby(Date(timesheet_detail.from_time))
 		.run()
@@ -965,6 +967,66 @@ def get_project_kanban_board(project: str) -> str | None:
 		filters = frappe.parse_json(board.filters or "[]")
 		if any(isinstance(f, list) and f[1:4] == ["project", "=", project] for f in filters):
 			return board.name
+
+
+@frappe.whitelist()
+def get_project_tasks(
+	project: str,
+	sort_by: str = "creation",
+	sort_order: str = "asc",
+	start: int = 0,
+	page_length: int = 50,
+	txt: str | None = None,
+) -> list[dict]:
+	"""One page of a project's tasks the user can read, for the Project form's Tasks tab.
+
+	`sort_by` can be any Task field the user may read. A Select field is ordered by its options (so
+	Priority runs Low to Urgent and Status follows the workflow) rather than alphabetically. Empty
+	values come last either way, and ties keep the order tasks were created in.
+	"""
+	if not frappe.has_permission("Project", "read", doc=project):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	sortable = set(frappe.model.get_permitted_fields("Task")) - set(frappe.model.optional_fields)
+	if sort_by not in sortable or sort_order not in ("asc", "desc"):
+		frappe.throw(_("Tasks cannot be sorted by {0} {1}").format(sort_by, sort_order))
+
+	Task = frappe.qb.DocType("Task")
+	df = frappe.get_meta("Task").get_field(sort_by)
+	sort_field = Task[sort_by]
+	is_empty = sort_field.isnull()
+	if df and df.fieldtype not in (*frappe.model.numeric_fieldtypes, *frappe.model.datetime_fields):
+		is_empty = is_empty | (sort_field == "")
+	if df and df.fieldtype == "Select" and df.options:
+		rank = Case()
+		for position, option in enumerate(df.options.split("\n")):
+			rank = rank.when(Task[sort_by] == option, position)
+		sort_field = rank
+
+	query = (
+		frappe.qb.get_query(
+			"Task",
+			fields=[
+				"name",
+				"subject",
+				"status",
+				"priority",
+				"_assign",
+				"exp_start_date",
+				"exp_end_date",
+				"progress",
+			],
+			filters={"project": project},
+			ignore_permissions=False,
+		)
+		.orderby(Case().when(is_empty, 1).else_(0))
+		.orderby(sort_field, order=Order.desc if sort_order == "desc" else Order.asc)
+		.orderby(Task.creation)
+		.limit(page_length)
+		.offset(start)
+	)
+	if txt:
+		query = query.where(Task.subject.like(f"%{txt}%") | Task.name.like(f"%{txt}%"))
+	return query.run(as_dict=True)
 
 
 @frappe.whitelist(methods=["POST"])

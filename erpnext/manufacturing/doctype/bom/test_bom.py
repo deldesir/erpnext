@@ -1463,7 +1463,7 @@ class TestBOM(ERPNextTestSuite):
 		bom.items[1].percentage = 60
 		bom.with_operations = 1
 		bom.track_semi_finished_goods = 1
-		self.assertRaisesRegex(frappe.ValidationError, "Produce an Item at Each Operation", bom.insert)
+		self.assertRaisesRegex(frappe.ValidationError, "Produce Item per Operation", bom.insert)
 
 	@timeout
 	def test_final_operation_must_produce_the_bom_item(self):
@@ -1802,6 +1802,32 @@ class TestBOM(ERPNextTestSuite):
 		parent = make_bom(item=fg_item, raw_materials=[sub_item])
 		self.assertAlmostEqual(parent.items[0].rate, sub_bom.total_cost / 9, places=2)
 
+	def test_exploded_items_cover_sub_assembly_process_loss(self):
+		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
+
+		rm_item = make_item("_Test Explosion Loss RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		sub_item = make_item("_Test Explosion Loss Sub", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		fg_item = make_item("_Test Explosion Loss FG", {"is_stock_item": 1}).name
+		make_bom(item=sub_item, raw_materials=[rm_item], process_loss_percentage=20)
+		parent = make_bom(item=fg_item, raw_materials=[sub_item])
+
+		self.assertEqual([(row.item_code, row.stock_qty) for row in parent.exploded_items], [(rm_item, 1.25)])
+
+	def test_exploded_items_ignore_phantom_process_loss(self):
+		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
+
+		rm_item = make_item("_Test Phantom Loss RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		phantom_item = make_item("_Test Phantom Loss Phantom", {"is_stock_item": 0, "stock_uom": "Kg"}).name
+		fg_item = make_item("_Test Phantom Loss FG", {"is_stock_item": 1}).name
+		phantom_bom = make_bom(
+			item=phantom_item, raw_materials=[rm_item], process_loss_percentage=20, do_not_save=True
+		)
+		phantom_bom.is_phantom_bom = 1
+		phantom_bom.submit()
+		parent = make_bom(item=fg_item, raw_materials=[phantom_item])
+
+		self.assertEqual([(row.item_code, row.stock_qty) for row in parent.exploded_items], [(rm_item, 1)])
+
 	def test_cancelling_the_default_bom_promotes_another_active_bom(self):
 		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
 
@@ -1901,7 +1927,9 @@ class TestBOM(ERPNextTestSuite):
 		bom.append("items", {"item_code": rm_item, "qty": 1, "operation_row_id": 1})
 		bom.insert()
 
-		self.assertRaisesRegex(frappe.ValidationError, "Step 2.*Add Raw Materials", bom.submit)
+		self.assertRaisesRegex(
+			frappe.ValidationError, f"Step 2.*Add Raw Materials.*output item.*{fg_item}", bom.submit
+		)
 
 	def test_changing_step_bom_replaces_its_raw_materials(self):
 		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom

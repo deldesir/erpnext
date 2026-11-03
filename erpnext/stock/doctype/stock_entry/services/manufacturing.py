@@ -8,6 +8,7 @@ from frappe.query_builder.functions import Coalesce, IfNull, Max, Min, NullIf, S
 from frappe.utils import ceil, cint, flt, get_link_to_form
 
 from erpnext.manufacturing.doctype.bom.bom import add_additional_cost
+from erpnext.manufacturing.doctype.work_order.mapper import get_upstream_process_loss
 from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle import get_auto_batch_nos
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
 from erpnext.stock.serial_batch_bundle import (
@@ -130,7 +131,7 @@ class BaseManufactureStockEntry(BaseStockEntry):
 
 	def set_process_loss_qty(self):
 		process_loss_qty = self.doc.get_pending_process_loss_qty()
-		if not process_loss_qty:
+		if not process_loss_qty and not (self.wo_doc and get_upstream_process_loss(self.wo_doc)):
 			process_loss_percentage = frappe.get_cached_value(
 				"BOM", self.doc.bom_no, "process_loss_percentage"
 			)
@@ -160,9 +161,13 @@ class BaseManufactureStockEntry(BaseStockEntry):
 
 		item_details["transfer_qty"] = item_details["qty"]
 
-		if self.wo_doc and cint(
-			frappe.db.get_single_value(
-				"Manufacturing Settings", "make_serial_no_batch_from_work_order", cache=True
+		if (
+			self.wo_doc
+			and (self.wo_doc.has_serial_no or self.wo_doc.has_batch_no)
+			and cint(
+				frappe.db.get_single_value(
+					"Manufacturing Settings", "make_serial_no_batch_from_work_order", cache=True
+				)
 			)
 		):
 			if self.wo_doc.has_serial_no:
@@ -175,6 +180,8 @@ class BaseManufactureStockEntry(BaseStockEntry):
 	def set_serial_nos_for_finished_good(self, item_details, existing_row=None):
 		serial_nos = self.get_available_serial_nos_for_fg(item_details.item_code)
 		if not serial_nos:
+			if not existing_row:
+				self.doc.append("items", item_details)
 			return
 
 		row = frappe._dict({"serial_nos": serial_nos[0 : cint(item_details.qty)]})
@@ -226,6 +233,8 @@ class BaseManufactureStockEntry(BaseStockEntry):
 		self.update_batches_to_be_consume(batches, row, qty)
 		if row.batches_to_be_consume:
 			self._link_fg_bundle_and_append(item_details, row, existing_row=existing_row)
+		elif not existing_row:
+			self.doc.append("items", item_details)
 
 	def _link_fg_bundle_and_append(self, item_details, row, existing_row=None):
 		_id = create_serial_and_batch_bundle(
@@ -302,13 +311,15 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 				continue
 
 			if self.check_invalid_serial_batch_nos_for_finished_good_item(row):
+				had_selection = row.serial_no or row.batch_no or row.serial_and_batch_bundle
 				self.reset_serial_batch_on_fg_row(row)
-				frappe.msgprint(
-					_(
-						"Row {0}: Serial/Batch has been reset to values linked with Work Order {1}"
-						" because the previously selected serial/batch does not belong to this Work Order."
-					).format(row.idx, frappe.bold(self.doc.work_order))
-				)
+				if had_selection:
+					frappe.msgprint(
+						_(
+							"Row {0}: Serial/Batch has been reset to values linked with Work Order {1}"
+							" because the previously selected serial/batch does not belong to this Work Order."
+						).format(row.idx, frappe.bold(self.doc.work_order))
+					)
 
 	def check_invalid_serial_batch_nos_for_finished_good_item(self, row) -> bool:
 		if self.wo_doc.has_serial_no:
@@ -419,12 +430,17 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		allowance_percentage = flt(
 			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order")
 		)
-		total_completed_qty = flt(self.doc.fg_completed_qty) + flt(self.wo_doc.produced_qty)
+		total_completed_qty = (
+			flt(self.doc.fg_completed_qty) + flt(self.wo_doc.produced_qty) + flt(self.wo_doc.process_loss_qty)
+		)
 		precision = self.doc.precision("fg_completed_qty")
 
 		for row in self.wo_doc.operations:
 			allowed_qty = (
-				row.completed_qty + row.process_loss_qty + (allowance_percentage / 100 * row.completed_qty)
+				row.completed_qty
+				+ row.process_loss_qty
+				+ get_upstream_process_loss(self.wo_doc, row)
+				+ (allowance_percentage / 100 * row.completed_qty)
 			)
 			if flt(total_completed_qty, precision) > flt(allowed_qty, precision):
 				self.throw_operations_not_complete_error(row, total_completed_qty)
@@ -508,6 +524,11 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		self.add_secondary_items_from_job_card()
 
 	def add_raw_materials(self):
+		if not self.wo_doc:
+			# nothing was transferred or consumed for a standalone entry, so follow the BOM
+			self.add_raw_materials_based_on_work_order()
+			return
+
 		material_consumption = frappe.db.get_single_value("Manufacturing Settings", "material_consumption")
 
 		if material_consumption and self.raw_materials_already_consumed():
@@ -1323,7 +1344,7 @@ class MaterialConsumptionForManufactureStockEntry(ManufactureStockEntry):
 		self.validate_alternative_items()
 
 	def add_items(self):
-		if self.backflush_based_on == "BOM" or self.wo_doc.skip_transfer:
+		if self.backflush_based_on == "BOM" or not self.wo_doc or self.wo_doc.skip_transfer:
 			self.add_raw_materials_based_on_work_order()
 		else:
 			self.add_raw_materials_based_on_transfer()

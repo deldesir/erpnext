@@ -53,6 +53,22 @@ class TestCompanyRestriction(ERPNextTestSuite):
 		self.restrict_to_companies("Supplier", supplier.name, ["_Test Company"])
 		create_purchase_order(supplier=supplier.name, do_not_submit=1)
 
+	def test_communication_ignores_company_restriction(self):
+		customer = make_customer("_Test Company Restricted Communication Customer")
+		self.restrict_to_companies("Customer", customer, ["_Test Company 1"])
+
+		frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"communication_medium": "Email",
+				"sent_or_received": "Sent",
+				"subject": "Restricted customer email",
+				"reference_doctype": "Customer",
+				"reference_name": customer,
+				"company": "_Test Company",
+			}
+		).insert()
+
 	def test_party_query_filters_customer_and_supplier_by_transaction_company(self):
 		customer = make_customer("_Test Company Query Restricted Customer")
 		supplier = create_supplier(supplier_name="_Test Company Query Restricted Supplier")
@@ -413,7 +429,7 @@ class TestCompanyRestriction(ERPNextTestSuite):
 		self.restrict_to_companies("Customer", restricted_customer, ["_Test Company 1"])
 
 		with self.set_user(self.make_report_user()):
-			items = {row.item_code for row in self.run_report("stock", "item_balance", {})}
+			items = {row.item_code for row in self.run_report("stock", "item_balance_(simple)", {})}
 			self.assertIn(allowed_item.name, items)
 			self.assertNotIn(restricted_item.name, items)
 
@@ -462,7 +478,7 @@ class TestCompanyRestriction(ERPNextTestSuite):
 		self.make_stock_in_both_companies()
 
 		with self.set_user(self.make_report_user()):
-			rows = self.run_report("stock", "item_balance", {})
+			rows = self.run_report("stock", "item_balance_(simple)", {})
 			warehouses = {row.warehouse for row in rows if row.item_code == "_Test Item"}
 			self.assertIn("Stores - _TC", warehouses)
 			self.assertNotIn("Stores - _TC1", warehouses)
