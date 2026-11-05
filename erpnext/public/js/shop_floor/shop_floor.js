@@ -112,7 +112,10 @@ class ShopFloor {
 		this.detail_container = this.wrapper.find(".sf-detail");
 		this.op_container = this.wrapper.find(".sf-operator");
 
-		this.wrapper.find(".sf-btn-home").on("click", () => (window.location.href = "/app"));
+		this.wrapper.find(".sf-btn-home").on(
+			"click",
+			() => (window.location.href = ((frappe.router && frappe.router._subpath_prefix) || "") + "/app")
+		);
 		this.wrapper.find(".sf-btn-refresh").on("click", () => this.refresh());
 		this.wrapper.find(".sf-btn-scan").on("click", () => this.open_scanner());
 		this.wrapper.find(".sf-btn-help").on("click", () => this.show_help());
@@ -1183,7 +1186,11 @@ class ShopFloor {
 			freeze_message: __("Preparing stock entry..."),
 			callback: (r) => {
 				if (r.message && r.message.name) {
-					window.open(`/app/stock-entry/${encodeURIComponent(r.message.name)}`, "_blank");
+					window.open(
+						((frappe.router && frappe.router._subpath_prefix) || "") +
+							`/app/stock-entry/${encodeURIComponent(r.message.name)}`,
+						"_blank"
+					);
 				}
 			},
 		});
