@@ -9,6 +9,7 @@ from frappe.core.doctype.communication.email import make
 from frappe.desk.form.load import get_attachments
 from frappe.model.document import Document
 from frappe.utils import get_url
+from frappe.utils.html_utils import sanitize_html
 from frappe.utils.print_format import download_pdf
 from frappe.utils.user import get_user_fullname
 
@@ -194,6 +195,7 @@ class RequestforQuotation(BuyingController):
 		self.validate_email_id(rfq_supplier)
 
 		message = self.supplier_rfq_mail(rfq_supplier, "", self.get_link(), True)
+		message["message"] = sanitize_html(message["message"])
 
 		return message
 
@@ -421,10 +423,10 @@ class RequestforQuotation(BuyingController):
 				supplier.quote_status = quote_status
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def send_supplier_emails(rfq_name: str):
 	check_portal_enabled("Request for Quotation")
-	rfq = frappe.get_doc("Request for Quotation", rfq_name)
+	rfq = frappe.get_doc("Request for Quotation", rfq_name, check_permission="write")
 	if rfq.docstatus == 1:
 		rfq.send_to_supplier()
 

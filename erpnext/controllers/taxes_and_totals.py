@@ -26,8 +26,8 @@ from erpnext.controllers.accounts_controller import (
 from erpnext.deprecation_dumpster import deprecated
 from erpnext.stock.get_item_details import (
 	NOT_APPLICABLE_TAX,
+	_get_item_tax_map,
 	_get_item_tax_template,
-	get_item_tax_map,
 	get_item_tax_template,
 )
 from erpnext.utilities.regional import temporary_flag
@@ -53,25 +53,13 @@ class calculate_taxes_and_totals:
 		if not len(self.doc.items):
 			return
 
-		self.discount_amount_applied = False
 		self.need_recomputation = False
 		self.ignore_tax_template_validation = ignore_tax_template_validation
 
-		self._calculate()
-
-		if self.doc.meta.get_field("discount_amount") and not self.has_mapped_discount:
-			self.set_discount_amount()
-			self.apply_discount_amount()
+		self.calculate_discounted_totals()
 
 		if not ignore_tax_template_validation and self.need_recomputation:
 			return self.calculate(ignore_tax_template_validation=True)
-
-		# Update grand total as per cash and non trade discount
-		if self.doc.apply_discount_on == "Grand Total" and self.doc.get("is_cash_or_non_trade_discount"):
-			self.doc.grand_total -= self.doc.discount_amount
-			self.doc.base_grand_total -= self.doc.base_discount_amount
-			self.doc.rounding_adjustment = self.doc.base_rounding_adjustment = 0.0
-			self.set_rounded_total()
 
 		self.calculate_shipping_charges()
 
@@ -80,6 +68,21 @@ class calculate_taxes_and_totals:
 
 		if self.doc.meta.get_field("other_charges_calculation"):
 			self.set_item_wise_tax_breakup()
+
+	def calculate_discounted_totals(self):
+		self.discount_amount_applied = False
+		self._calculate()
+
+		if self.doc.meta.get_field("discount_amount") and not self.has_mapped_discount:
+			self.set_discount_amount()
+			self.apply_discount_amount()
+
+		# Update grand total as per cash and non trade discount
+		if self.doc.apply_discount_on == "Grand Total" and self.doc.get("is_cash_or_non_trade_discount"):
+			self.doc.grand_total -= self.doc.discount_amount
+			self.doc.base_grand_total -= self.doc.base_discount_amount
+			self.doc.rounding_adjustment = self.doc.base_rounding_adjustment = 0.0
+			self.set_rounded_total()
 
 	def _calculate(self):
 		self.validate_conversion_rate()
@@ -183,7 +186,7 @@ class calculate_taxes_and_totals:
 
 	def update_item_tax_map(self):
 		for item in self.doc.items:
-			item.item_tax_rate = get_item_tax_map(
+			item.item_tax_rate = _get_item_tax_map(
 				doc=self.doc,
 				tax_template=item.item_tax_template,
 				as_json=True,
@@ -270,7 +273,13 @@ class calculate_taxes_and_totals:
 			self.calculate_item_rate(item)
 
 			item.net_rate = item.rate
-			if not item.qty and self.doc.get("is_return") and self.doc.get("doctype") != "Purchase Receipt":
+			# A return row that moves nothing adjusts the rate. A fully rejected row moves its
+			# rejected qty, so it bills what the original invoice billed.
+			if (
+				not (flt(item.qty) or flt(item.get("rejected_qty")))
+				and self.doc.get("is_return")
+				and self.doc.get("doctype") != "Purchase Receipt"
+			):
 				item.amount = flt(-1 * item.rate, item.precision("amount"))
 			elif not item.qty and self.doc.get("is_debit_note"):
 				item.amount = flt(item.rate, item.precision("amount"))
@@ -530,7 +539,7 @@ class calculate_taxes_and_totals:
 			shipping_rule = frappe.get_doc("Shipping Rule", self.doc.shipping_rule)
 			shipping_rule.apply(self.doc)
 
-			self._calculate()
+			self.calculate_discounted_totals()
 
 	def calculate_taxes(self):
 		# reset value from earlier calculations
@@ -982,6 +991,20 @@ class calculate_taxes_and_totals:
 				)
 
 			self._set_in_company_currency(self.doc, ["rounding_adjustment", "rounded_total"])
+
+			if self.doc.rounding_adjustment:
+				# Keep the converted payable/receivable consistent with payments and returns.
+				self.doc.base_rounding_adjustment = flt(
+					self.doc.base_rounded_total - self.doc.base_grand_total,
+					self.doc.precision("base_rounding_adjustment"),
+				)
+			elif self.doc.rounded_total:
+				# converting the rounded total on its own can differ from the row-wise base total by a
+				# currency fraction; derive it from the base totals the ledger is posted with
+				self.doc.base_rounded_total = flt(
+					self.doc.base_grand_total + self.doc.base_rounding_adjustment,
+					self.doc.precision("base_rounded_total"),
+				)
 
 	def set_discount_amount(self):
 		if self.doc.additional_discount_percentage:

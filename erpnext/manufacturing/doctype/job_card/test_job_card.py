@@ -637,6 +637,35 @@ class TestJobCard(ERPNextTestSuite):
 		# JC is Completed with excess transfer
 		self.assertEqual(job_card.status, "Completed")
 
+	def test_transfer_refuses_job_card_item_of_other_job_card(self):
+		self.transfer_material_against = "Job Card"
+		self.source_warehouse = "Stores - _TC"
+		self.generate_required_stock(self.work_order)
+		job_card = frappe.get_last_doc("Job Card", {"work_order": self.work_order.name})
+
+		other_work_order = make_wo_order_test_record(
+			item="_Test FG Item 2",
+			qty=2,
+			transfer_material_against="Job Card",
+			source_warehouse="Stores - _TC",
+		)
+		other_job_card = frappe.get_last_doc("Job Card", {"work_order": other_work_order.name})
+
+		transfer_entry = make_stock_entry_from_jc(job_card.name)
+		transfer_entry.items[0].job_card_item = other_job_card.items[0].name
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			f"Job Card Item {other_job_card.items[0].name} does not belong to Job Card {job_card.name}",
+			transfer_entry.insert,
+		)
+
+		transfer_entry = make_stock_entry_from_jc(job_card.name)
+		transfer_entry.submit()
+		self.assertEqual(
+			frappe.db.get_value("Job Card Item", job_card.items[0].name, "transferred_qty"),
+			job_card.items[0].required_qty,
+		)
+
 	def test_job_card_actions_blocked_until_material_transfer(self):
 		"Start and Complete must wait for the transfer when RMs move against Job Card."
 		self.transfer_material_against = "Job Card"
@@ -1890,6 +1919,82 @@ class TestJobCard(ERPNextTestSuite):
 		self.assertEqual(flt(job_card.for_quantity), 5)
 		self.assertEqual(flt(job_card.total_completed_qty), 5)
 		self.assertEqual(flt(job_card.process_loss_qty), 0)
+
+	def test_completion_keeps_process_loss_across_cycles(self):
+		work_order = self.make_two_operation_work_order(qty=10)
+		first, second = (
+			frappe.get_doc("Job Card", name)
+			for name in frappe.get_all(
+				"Job Card", filters={"work_order": work_order.name}, order_by="sequence_id", pluck="name"
+			)
+		)
+
+		first.append("time_logs", {"from_time": "2024-03-03 08:00:00"})
+		first.save()
+		first.complete_job_card(
+			qty=4,
+			for_quantity=10,
+			pending_qty=5,
+			process_loss_qty=1,
+			end_time="2024-03-03 09:00:00",
+		)
+
+		first.reload()
+		self.assertEqual(flt(first.for_quantity), 10)
+		self.assertEqual(flt(first.total_completed_qty), 4)
+		self.assertEqual(flt(first.process_loss_qty), 1)
+		self.assertEqual(flt(first.pending_qty), 5)
+
+		# The second cycle takes up the pending qty and adds its own loss to the first cycle's.
+		first.append("time_logs", {"from_time": "2024-03-03 10:00:00"})
+		first.save()
+		first.complete_job_card(
+			qty=4,
+			for_quantity=5,
+			pending_qty=0,
+			process_loss_qty=1,
+			end_time="2024-03-03 11:00:00",
+		)
+
+		first.reload()
+		self.assertEqual(flt(first.for_quantity), 10)
+		self.assertEqual(flt(first.total_completed_qty), 8)
+		self.assertEqual(flt(first.process_loss_qty), 2)
+		self.assertEqual(flt(first.pending_qty), 0)
+
+		first.submit()
+		operation = frappe.db.get_value(
+			"Work Order Operation",
+			first.operation_id,
+			["completed_qty", "process_loss_qty", "pending_qty"],
+			as_dict=True,
+		)
+		self.assertEqual(flt(operation.completed_qty), 8)
+		self.assertEqual(flt(operation.process_loss_qty), 2)
+		self.assertEqual(flt(operation.pending_qty), 0)
+
+		second.append("time_logs", {"from_time": "2024-03-03 12:00:00"})
+		second.save()
+		second.complete_job_card(
+			qty=8,
+			for_quantity=8,
+			pending_qty=0,
+			process_loss_qty=0,
+			end_time="2024-03-03 13:00:00",
+		)
+		second.reload()
+		second.submit()
+
+		# The manufacture entry for the full order qty books the loss and closes the order.
+		stock_entry = frappe.get_doc(make_stock_entry_for_work_order(work_order.name, "Manufacture", 10))
+		stock_entry.submit()
+		self.assertEqual(flt(stock_entry.process_loss_qty), 2)
+		self.assertEqual(sum(row.qty for row in stock_entry.items if row.is_finished_item), 8)
+
+		work_order.reload()
+		self.assertEqual(flt(work_order.produced_qty), 8)
+		self.assertEqual(flt(work_order.process_loss_qty), 2)
+		self.assertEqual(work_order.status, "Completed")
 
 	def test_op_cost_calculation(self):
 		from erpnext.manufacturing.doctype.routing.test_routing import (
@@ -4105,6 +4210,265 @@ class TestJobCard(ERPNextTestSuite):
 		self.assertEqual((job_card.total_completed_qty, job_card.process_loss_qty), (10, 0))
 
 	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_partial_sub_operation_cycles_keep_job_card_qty(self):
+		workstation = make_jc_review_workstation()
+		cutting = make_jc_review_operation(workstation)
+		welding = make_jc_review_operation(workstation)
+		operation = make_jc_review_operation(
+			workstation, sub_operations=[{"operation": cutting}, {"operation": welding}]
+		)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+		)
+
+		job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+		cycles = [
+			(cutting, {"for_quantity": 10, "qty": 5, "pending_qty": 5}, (10, 0, 10, 0)),
+			(welding, {"for_quantity": 5, "qty": 5}, (10, 5, 5, 0)),
+			(cutting, {"for_quantity": 5, "qty": 4, "process_loss_qty": 1}, (10, 5, 4, 1)),
+		]
+		for idx, (sub_operation, qty, expected) in enumerate(cycles):
+			start = add_to_date("2031-03-03 08:00:00", hours=idx)
+			job_card.start_timer(start_time=start)
+			job_card.complete_job_card(
+				end_time=add_to_date(start, minutes=30), sub_operation=sub_operation, **qty
+			)
+			job_card.reload()
+			self.assertEqual(
+				(
+					job_card.for_quantity,
+					job_card.total_completed_qty,
+					job_card.pending_qty,
+					job_card.process_loss_qty,
+				),
+				expected,
+			)
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_loss_of_lagging_sub_operation_does_not_grow_job_card_qty(self):
+		workstation = make_jc_review_workstation()
+		cutting = make_jc_review_operation(workstation)
+		welding = make_jc_review_operation(workstation)
+		operation = make_jc_review_operation(
+			workstation, sub_operations=[{"operation": cutting}, {"operation": welding}]
+		)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+		)
+
+		job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+		cycles = [
+			(cutting, {"for_quantity": 10, "qty": 5, "pending_qty": 5}),
+			(welding, {"for_quantity": 5, "qty": 4, "process_loss_qty": 1}),
+			(cutting, {"for_quantity": 5, "qty": 5}),
+			(welding, {"for_quantity": 5, "qty": 5}),
+		]
+		for idx, (sub_operation, qty) in enumerate(cycles):
+			start = add_to_date("2031-03-03 08:00:00", hours=idx)
+			job_card.start_timer(start_time=start)
+			job_card.complete_job_card(
+				end_time=add_to_date(start, minutes=30), sub_operation=sub_operation, **qty
+			)
+			job_card.reload()
+
+		self.assertEqual(
+			(
+				job_card.for_quantity,
+				job_card.total_completed_qty,
+				job_card.pending_qty,
+				job_card.process_loss_qty,
+			),
+			(10, 9, 0, 1),
+		)
+		self.assertEqual([row.process_loss_qty for row in job_card.sub_operations], [0, 1])
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_process_loss_of_first_sub_operation_is_kept_while_next_is_pending(self):
+		workstation = make_jc_review_workstation()
+		cutting = make_jc_review_operation(workstation)
+		welding = make_jc_review_operation(workstation)
+		operation = make_jc_review_operation(
+			workstation, sub_operations=[{"operation": cutting}, {"operation": welding}]
+		)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+		)
+
+		job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+		start = "2031-03-03 08:00:00"
+		job_card.start_timer(start_time=start)
+		job_card.complete_job_card(
+			end_time=add_to_date(start, minutes=30),
+			sub_operation=cutting,
+			for_quantity=10,
+			qty=9,
+			process_loss_qty=1,
+		)
+		job_card.reload()
+		self.assertEqual((job_card.total_completed_qty, job_card.process_loss_qty), (0, 1))
+
+		job_card.start_timer(start_time=add_to_date(start, minutes=40))
+		job_card.complete_job_card(
+			end_time=add_to_date(start, minutes=70), sub_operation=welding, for_quantity=9, qty=9
+		)
+		job_card.reload()
+		self.assertEqual(
+			(job_card.for_quantity, job_card.total_completed_qty, job_card.process_loss_qty), (10, 9, 1)
+		)
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_complete_job_card_without_end_time_keeps_earlier_cycles(self):
+		workstation = make_jc_review_workstation()
+		cutting = make_jc_review_operation(workstation)
+		welding = make_jc_review_operation(workstation)
+		operation = make_jc_review_operation(
+			workstation, sub_operations=[{"operation": cutting}, {"operation": welding}]
+		)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+		)
+
+		job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+		start = "2031-03-03 08:00:00"
+		for idx, (sub_operation, qty) in enumerate(((cutting, 10), (welding, 5))):
+			job_card.start_timer(start_time=add_to_date(start, hours=idx))
+			job_card.complete_job_card(
+				end_time=add_to_date(start, hours=idx, minutes=30),
+				sub_operation=sub_operation,
+				for_quantity=10,
+				qty=qty,
+				pending_qty=10 - qty,
+			)
+			job_card.reload()
+
+		job_card.complete_job_card(sub_operation=welding, qty=5, pending_qty=5)
+		job_card.reload()
+
+		self.assertEqual([row.completed_qty for row in job_card.time_logs], [10, 5])
+		self.assertEqual([row.completed_qty for row in job_card.sub_operations], [10, 5])
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_complete_job_card_without_end_time_with_two_operators(self):
+		workstation = make_jc_review_workstation()
+		cutting = make_jc_review_operation(workstation)
+		welding = make_jc_review_operation(workstation)
+		operation = make_jc_review_operation(
+			workstation, sub_operations=[{"operation": cutting}, {"operation": welding}]
+		)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+		)
+		first_operator, second_operator = make_jc_review_employee(), make_jc_review_employee()
+
+		job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+		start = "2031-03-04 08:00:00"
+		cycles = ((cutting, 10, [first_operator]), (welding, 5, [first_operator, second_operator]))
+		for idx, (sub_operation, qty, operators) in enumerate(cycles):
+			job_card.start_timer(
+				start_time=add_to_date(start, hours=idx),
+				employees=[{"employee": operator} for operator in operators],
+			)
+			job_card.complete_job_card(
+				end_time=add_to_date(start, hours=idx, minutes=30),
+				sub_operation=sub_operation,
+				for_quantity=10,
+				qty=qty,
+				pending_qty=10 - qty,
+			)
+			job_card.reload()
+
+		job_card.complete_job_card(sub_operation=welding, qty=5, pending_qty=5)
+		job_card.reload()
+
+		self.assertEqual([row.completed_qty for row in job_card.sub_operations], [10, 5])
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_cycle_qty_goes_on_latest_time_log_when_operators_change(self):
+		workstation = make_jc_review_workstation()
+		cutting = make_jc_review_operation(workstation)
+		welding = make_jc_review_operation(workstation)
+		operation = make_jc_review_operation(
+			workstation, sub_operations=[{"operation": cutting}, {"operation": welding}]
+		)
+		first_operator, second_operator = make_jc_review_employee(), make_jc_review_employee()
+
+		def complete_cycles(cycles, start):
+			wo = make_jc_review_work_order(
+				make_jc_review_item(),
+				[{"item_code": make_jc_review_item(), "qty": 1}],
+				[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			)
+			job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+			for idx, (sub_operation, for_quantity, qty, operators) in enumerate(cycles):
+				job_card.start_timer(
+					start_time=add_to_date(start, hours=idx),
+					employees=[{"employee": operator} for operator in operators],
+				)
+				job_card.complete_job_card(
+					end_time=add_to_date(start, hours=idx, minutes=30),
+					sub_operation=sub_operation,
+					for_quantity=for_quantity,
+					qty=qty,
+					pending_qty=for_quantity - qty,
+				)
+				job_card.reload()
+			return job_card
+
+		job_card = complete_cycles(
+			(
+				(cutting, 10, 5, [second_operator]),
+				(welding, 5, 5, [first_operator]),
+				(cutting, 5, 5, [second_operator]),
+			),
+			"2031-03-05 08:00:00",
+		)
+		self.assertEqual([row.completed_qty for row in job_card.sub_operations], [10, 5])
+
+		job_card = complete_cycles(
+			((cutting, 10, 10, [second_operator]), (welding, 10, 5, [first_operator, second_operator])),
+			"2031-03-06 08:00:00",
+		)
+		job_card.complete_job_card(sub_operation=welding, qty=5, pending_qty=5)
+		job_card.reload()
+		self.assertEqual([row.completed_qty for row in job_card.sub_operations], [10, 5])
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_cycle_qty_goes_on_open_time_log_with_backdated_log_after_it(self):
+		workstation = make_jc_review_workstation()
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[
+				{
+					"operation": make_jc_review_operation(workstation),
+					"workstation": workstation,
+					"time_in_mins": 60,
+				}
+			],
+		)
+		operator = make_jc_review_employee()
+
+		job_card = frappe.get_doc("Job Card", get_jc_review_job_cards(wo.name)[0].name)
+		job_card.start_timer(start_time="2031-03-07 10:00:00", employees=[{"employee": operator}])
+		job_card.reload()
+		job_card.append("time_logs", jc_review_log("2031-03-07 08:00:00", 60, 2, operator))
+
+		job_card.complete_job_card(end_time="2031-03-07 11:00:00", qty=5, pending_qty=3)
+		job_card.reload()
+
+		self.assertEqual(job_card.total_completed_qty, 7)
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
 	def test_operation_cost_uses_each_job_card_workstation_rate(self):
 		first_workstation = make_jc_review_workstation(hour_rate=600)
 		second_workstation = make_jc_review_workstation(hour_rate=1200)
@@ -4310,6 +4674,159 @@ class TestJobCard(ERPNextTestSuite):
 		job_card.reload()
 		job_card.append("time_logs", jc_review_log("2031-03-07 08:00:00", 60, 10))
 		self.assertRaisesRegex(frappe.ValidationError, "Move the raw materials", job_card.submit)
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_job_card_with_fractional_material_can_be_submitted_after_full_transfer(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation)
+		raw_material = make_jc_review_item(stock_uom="Kg")
+		make_stock_entry(item_code=raw_material, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": raw_material, "qty": 1, "operation": operation}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			qty=1,
+			bom_quantity=3,
+			transfer_material_against="Job Card",
+		)
+		job_card = get_jc_review_job_cards(wo.name)[0]
+		frappe.get_doc(make_stock_entry_from_jc(job_card.name)).submit()
+
+		job_card.reload()
+		job_card.append("time_logs", jc_review_log("2031-03-07 08:00:00", 60, 1))
+		job_card.submit()
+
+		self.assertEqual(job_card.docstatus, 1)
+
+	@ERPNextTestSuite.change_settings("System Settings", {"float_precision": 3})
+	def test_full_transfer_of_a_required_qty_with_more_decimals_than_float_precision(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation)
+		raw_material = make_jc_review_item(stock_uom="Kg")
+		make_stock_entry(item_code=raw_material, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": raw_material, "qty": 1, "operation": operation}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			qty=2,
+			bom_quantity=3,
+			transfer_material_against="Job Card",
+		)
+		job_card = get_jc_review_job_cards(wo.name)[0]
+		frappe.get_doc(make_stock_entry_from_jc(job_card.name)).submit()  # 2/3 Kg
+
+		job_card.reload()
+		self.assertEqual(job_card.items[0].transferred_qty, 0.667)
+		self.assertEqual(job_card.status, "Material Transferred")
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_split_job_cards_with_fractional_material_can_be_submitted_after_full_transfer(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation, create_job_card_based_on_batch_size=1, batch_size=1)
+		raw_material = make_jc_review_item(stock_uom="Kg")
+		make_stock_entry(item_code=raw_material, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": raw_material, "qty": 1, "operation": operation}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			qty=3,
+			bom_quantity=3,
+			transfer_material_against="Job Card",
+		)
+		job_cards = get_jc_review_job_cards(wo.name)
+		self.assertEqual(len(job_cards), 3)
+		for index, job_card in enumerate(job_cards):
+			frappe.get_doc(make_stock_entry_from_jc(job_card.name)).submit()
+			job_card.reload()
+			job_card.append("time_logs", jc_review_log(f"2031-03-07 0{index}:00:00", 60, 1))
+			job_card.submit()
+
+		self.assertEqual([job_card.docstatus for job_card in job_cards], [1, 1, 1])
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_last_split_job_card_transfers_the_rounding_remainder(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation, create_job_card_based_on_batch_size=1, batch_size=1)
+		raw_material = make_jc_review_item(stock_uom="Kg")
+		make_stock_entry(item_code=raw_material, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": raw_material, "qty": 1, "operation": operation}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			qty=3,
+			bom_quantity=3,
+			transfer_material_against="Job Card",
+		)
+		for index, job_card in enumerate(get_jc_review_job_cards(wo.name)):
+			frappe.get_doc(make_stock_entry_from_jc(job_card.name)).submit()
+			job_card.reload()
+			job_card.append("time_logs", jc_review_log(f"2031-03-07 0{index}:00:00", 60, 1))
+			job_card.submit()
+
+		wo.reload()
+		self.assertEqual(wo.required_items[0].transferred_qty, 1)
+		manufacture = frappe.get_doc(make_stock_entry_for_work_order(wo.name, "Manufacture", 3))
+		manufacture.submit()
+		self.assertEqual(manufacture.docstatus, 1)
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_split_job_card_raised_above_operation_qty_gets_its_full_share(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation, create_job_card_based_on_batch_size=1, batch_size=5)
+		raw_material = make_jc_review_item(stock_uom="Kg")
+
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": raw_material, "qty": 1, "operation": operation}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			qty=10,
+			transfer_material_against="Job Card",
+		)
+		job_card = get_jc_review_job_cards(wo.name)[1]
+		job_card.for_quantity = 6
+		job_card.items = []
+		job_card.get_required_items()
+
+		self.assertEqual(job_card.items[0].required_qty, 6)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings",
+		{"disable_capacity_planning": 1, "overproduction_percentage_for_work_order": 100},
+	)
+	def test_split_job_cards_keep_rounded_shares_on_recalculation_and_submit(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation, create_job_card_based_on_batch_size=1, batch_size=1)
+		raw_material = make_jc_review_item(stock_uom="Kg")
+		make_stock_entry(item_code=raw_material, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": raw_material, "qty": 2, "operation": operation}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 60}],
+			qty=3,
+			bom_quantity=3,
+			transfer_material_against="Job Card",
+		)
+		job_card = get_jc_review_job_cards(wo.name)[1]
+		for for_quantity in (2, 1):
+			job_card.for_quantity = for_quantity
+			job_card.items = []
+			job_card.get_required_items()
+			job_card.save()
+
+		job_cards = get_jc_review_job_cards(wo.name)
+		self.assertEqual(flt(sum(job_card.items[0].required_qty for job_card in job_cards), 3), 2)
+		for index, job_card in enumerate(job_cards):
+			frappe.get_doc(make_stock_entry_from_jc(job_card.name)).submit()
+			job_card.reload()
+			job_card.append("time_logs", jc_review_log(f"2031-03-08 0{index}:00:00", 60, 1))
+			job_card.submit()
+
+		self.assertEqual([job_card.docstatus for job_card in job_cards], [1, 1, 1])
 
 	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
 	def test_repeated_operation_gets_only_its_own_materials(self):
@@ -5121,14 +5638,14 @@ def make_jc_review_operation(workstation, **values):
 	return operation.name
 
 
-def make_jc_review_work_order(fg_item, rows, operations, qty=10, **kwargs):
+def make_jc_review_work_order(fg_item, rows, operations, qty=10, bom_quantity=1, **kwargs):
 	bom = frappe.get_doc(
 		{
 			"doctype": "BOM",
 			"item": fg_item,
 			"company": "_Test Company",
 			"currency": "INR",
-			"quantity": 1,
+			"quantity": bom_quantity,
 			"rm_cost_as_per": "Valuation Rate",
 			"with_operations": 1,
 			"items": rows,

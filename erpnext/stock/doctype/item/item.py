@@ -218,6 +218,7 @@ class Item(Document):
 					queue="long",
 					timeout=600,
 					job_name=f"set_opening_stock_for_{self.name}",
+					enqueue_after_commit=True,
 				)
 				frappe.msgprint(
 					_(
@@ -341,7 +342,10 @@ class Item(Document):
 			if not exchange_rate:
 				return False
 
-			price_list_rate = price_list_rate / exchange_rate
+			price_list_rate = flt(
+				price_list_rate / exchange_rate,
+				frappe.get_precision("Item Price", "price_list_rate", currency),
+			)
 
 		frappe.get_doc(
 			{
@@ -501,26 +505,6 @@ class Item(Document):
 						bold(tax.meta.get_translated_label("minimum_net_rate")),
 					)
 				)
-
-	def update_template_tables(self):
-		template = frappe.get_cached_doc("Item", self.variant_of)
-
-		# add item taxes from template
-		for d in template.get("taxes"):
-			self.append("taxes", d)
-
-		# copy re-order table if empty
-		if not self.get("reorder_levels"):
-			for d in template.get("reorder_levels"):
-				n = {}
-				for k in (
-					"warehouse",
-					"warehouse_reorder_level",
-					"warehouse_reorder_qty",
-					"material_request_type",
-				):
-					n[k] = d.get(k)
-				self.append("reorder_levels", n)
 
 	def validate_conversion_factor(self):
 		check_list = []
@@ -774,7 +758,7 @@ class Item(Document):
 			"Note: To merge the items, create a separate Stock Reconciliation for the old item {0}"
 		).format(frappe.bold(old_name))
 
-		frappe.throw(_(msg), title=_("Cannot Merge"), exc=DataValidationError)
+		frappe.throw(msg, title=_("Cannot Merge"), exc=DataValidationError)
 
 	def validate_properties_before_merge(self, new_name):
 		# Validate properties before merging
@@ -938,19 +922,6 @@ class Item(Document):
 				self.append(
 					"item_defaults",
 					{"company": defaults.get("company"), "default_warehouse": defaults.default_warehouse},
-				)
-
-		if not self.taxes and item_group.taxes:
-			for tax in item_group.taxes:
-				self.append(
-					"taxes",
-					{
-						"item_tax_template": tax.item_tax_template,
-						"tax_category": tax.tax_category,
-						"valid_from": tax.valid_from,
-						"minimum_net_rate": tax.minimum_net_rate,
-						"maximum_net_rate": tax.maximum_net_rate,
-					},
 				)
 
 	def update_variants(self):
@@ -1582,6 +1553,8 @@ def get_last_purchase_details(item_code, doc_name=None, conversion_rate=1.0):
 		{
 			"price_list_rate": out.base_price_list_rate / conversion_rate,
 			"rate": out.base_rate / conversion_rate,
+			# a rate above the price list rate is a margin, not a discount
+			"discount_amount": max(out.base_price_list_rate - out.base_rate, 0) / conversion_rate,
 			"base_rate": out.base_rate,
 			"base_net_rate": out.base_net_rate,
 		}

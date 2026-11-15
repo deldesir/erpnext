@@ -740,7 +740,7 @@ class ShopFloor {
 					label: __("Start Time"),
 					fieldname: "start_time",
 					fieldtype: "Datetime",
-					default: frappe.datetime.now_datetime(),
+					default: frappe.datetime.system_datetime(),
 				},
 				{ fieldtype: "Section Break" },
 				{
@@ -796,11 +796,11 @@ class ShopFloor {
 	}
 
 	pause_job(jc_name) {
-		this.update_job_card(jc_name, "pause_job", { end_time: frappe.datetime.now_datetime() });
+		this.update_job_card(jc_name, "pause_job", { end_time: frappe.datetime.system_datetime() });
 	}
 
 	resume_job(jc_name) {
-		this.update_job_card(jc_name, "resume_job", { start_time: frappe.datetime.now_datetime() });
+		this.update_job_card(jc_name, "resume_job", { start_time: frappe.datetime.system_datetime() });
 	}
 
 	end_session(jc_name) {
@@ -922,7 +922,7 @@ class ShopFloor {
 				fieldtype: "Datetime",
 				label: __("End Time"),
 				fieldname: "end_time",
-				default: frappe.datetime.now_datetime(),
+				default: frappe.datetime.system_datetime(),
 			},
 		];
 
@@ -1253,7 +1253,7 @@ class ShopFloor {
 					total += moment(log.to_time).diff(log.from_time, "seconds");
 				}
 			} else {
-				total += moment().diff(log.from_time, "seconds");
+				total += moment(frappe.datetime.system_datetime()).diff(log.from_time, "seconds");
 			}
 		}
 		return total;
