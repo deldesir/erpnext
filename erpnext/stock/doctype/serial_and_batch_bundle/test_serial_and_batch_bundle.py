@@ -15,6 +15,7 @@ from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle impor
 	combine_datetime,
 	get_available_batches_qty,
 	get_qty_based_available_batches,
+	get_serial_batch_ledgers,
 	get_serial_nos_based_on_posting_date,
 	get_type_of_transaction,
 	parse_serial_nos,
@@ -106,6 +107,49 @@ class TestSerialBatchBundleEntry(ERPNextTestSuite):
 
 
 class TestSerialandBatchBundle(ERPNextTestSuite):
+	def test_return_row_loads_the_returned_voucher_batches(self):
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+		from erpnext.stock.doctype.purchase_receipt.test_purchase_receipt import make_purchase_receipt
+
+		item_code = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "RTB-.#####",
+			}
+		).name
+		receipt = make_purchase_receipt(item_code=item_code, qty=4, rejected_qty=2, rate=10)
+		batch_no = frappe.db.get_value(
+			"Serial and Batch Entry", {"parent": receipt.items[0].serial_and_batch_bundle}, "batch_no"
+		)
+		# a request hands the row over as a plain dict
+		return_row = dict(make_return_doc("Purchase Receipt", receipt.name).items[0].as_dict())
+
+		ledgers = get_serial_batch_ledgers(item_code=item_code, child_row=return_row)
+		self.assertEqual([row.get("batch_no") for row in ledgers], [batch_no])
+
+		from_rejected_warehouse = make_return_doc(
+			"Purchase Receipt", receipt.name, return_against_rejected_qty=True
+		).items[0]
+		for rejected_row in (
+			{**return_row, "qty": 0, "is_rejected": 1},
+			dict(from_rejected_warehouse.as_dict()),
+		):
+			rejected = get_serial_batch_ledgers(item_code=item_code, child_row=rejected_row)
+			self.assertEqual(
+				[(row.qty, row.warehouse) for row in rejected], [(2, receipt.items[0].rejected_warehouse)]
+			)
+
+	def test_voucher_no_and_voucher_type_are_indexed(self):
+		if frappe.db.db_type != "mariadb":
+			self.skipTest("MariaDB index names")
+
+		self.assertTrue(frappe.db.has_index("tabSerial and Batch Bundle", "voucher_no_voucher_type_index"))
+		self.assertFalse(
+			frappe.db.get_column_index("tabSerial and Batch Bundle", "voucher_type", unique=False)
+		)
+
 	def test_serial_availability_at_posting_cutoff(self):
 		from erpnext.stock.doctype.stock_reconciliation.stock_reconciliation import get_stock_balance_for
 
@@ -2098,6 +2142,42 @@ class TestSerialandBatchBundle(ERPNextTestSuite):
 			do_not_submit=True,
 		)
 		self.assertRaises(NegativeStockError, backdated.submit)
+
+	def test_batch_quantity_check_sums_entries_before_posting_time(self):
+		item_code = "Test Batch Quantity Before Posting Item"
+		(batch_no,) = self._setup_negative_batch_item(item_code, ["TBQBP-BATCH-001"])
+		warehouse = "_Test Warehouse - _TC"
+
+		for qty, days, is_inward in ((100, -10, True), (30, -5, False), (20, -1, True)):
+			make_stock_entry(
+				item_code=item_code,
+				qty=qty,
+				rate=100,
+				target=warehouse if is_inward else None,
+				source=None if is_inward else warehouse,
+				use_serial_batch_fields=True,
+				batch_no=batch_no,
+				posting_date=add_days(today(), days),
+				posting_time="10:00:00",
+			)
+
+		outward = make_stock_entry(
+			item_code=item_code,
+			qty=10,
+			source=warehouse,
+			use_serial_batch_fields=True,
+			batch_no=batch_no,
+			posting_date=add_days(today(), -3),
+			posting_time="10:00:00",
+		)
+		bundle = frappe.get_doc("Serial and Batch Bundle", outward.items[0].serial_and_batch_bundle)
+		posting_datetime = frappe.utils.get_datetime(bundle.posting_datetime)
+
+		self.assertEqual(bundle.get_batchwise_qty_before(posting_datetime), {batch_no: 70})
+		self.assertEqual(
+			sorted(flt(row.qty) for row in bundle.get_available_qty_from_sabb(posting_datetime)), [-10, 20]
+		)
+		self.assertEqual(bundle.get_batchwise_available_qty(), {batch_no: 80})
 
 	def make_serial_item_for_valuation(self, item_code, use_serial_no_wise_valuation):
 		return make_item(

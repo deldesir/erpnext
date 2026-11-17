@@ -12,7 +12,10 @@ from frappe.utils import cint, flt, formatdate, get_link_to_form
 from frappe.utils.data import comma_and
 
 import erpnext
-from erpnext.accounts.deferred_revenue import validate_service_stop_date
+from erpnext.accounts.deferred_revenue import (
+	validate_deferred_revenue_return_cancellation,
+	validate_service_stop_date,
+)
 from erpnext.accounts.doctype.loyalty_program.loyalty_program import validate_loyalty_points
 from erpnext.accounts.doctype.pricing_rule.utils import (
 	update_coupon_code_count,
@@ -34,6 +37,7 @@ from erpnext.controllers.selling_controller import SellingController
 from erpnext.setup.doctype.company.company import update_company_current_month_sales
 from erpnext.stock.doctype.delivery_note.services.billing_status import (
 	update_billed_amount_based_on_so,
+	update_billing_percentage_of_returns,
 )
 from erpnext.stock.utils import get_bin_qty_map
 
@@ -470,6 +474,8 @@ class SalesInvoice(SellingController):
 				self.make_bundle_using_old_serial_batch_fields(table_name)
 
 			self.validate_standalone_serial_nos_customer()
+			# reservations read the delivered serial and batch nos from the bundles
+			self.make_packed_item_bundles()
 			self.update_stock_reservation_entries()
 			self.update_stock_ledger()
 
@@ -534,6 +540,7 @@ class SalesInvoice(SellingController):
 			self.refresh_subscription_status()
 
 	def before_cancel(self):
+		validate_deferred_revenue_return_cancellation(self)
 		POSService(self).check_if_created_using_pos_and_pos_closing_entry_generated()
 		POSService(self).check_if_consolidated_invoice()
 
@@ -1222,6 +1229,17 @@ class SalesInvoice(SellingController):
 		for dn in set(updated_delivery_notes):
 			frappe.get_doc("Delivery Note", dn).update_billing_percentage(update_modified=update_modified)
 
+		# Returns of all deliveries of a Sales Order row share the row's over-billed qty.
+		so_details = [d.so_detail for d in self.items if d.so_detail]
+		sibling_delivery_notes = frappe.get_all(
+			"Delivery Note Item",
+			filters={"so_detail": ("in", so_details), "docstatus": 1},
+			pluck="parent",
+			distinct=True,
+		)
+		for dn in set(updated_delivery_notes + sibling_delivery_notes):
+			update_billing_percentage_of_returns(dn)
+
 	def on_recurring(self, reference_doc, auto_repeat_doc):
 		super().on_recurring(reference_doc, auto_repeat_doc)
 		self.set("write_off_amount", reference_doc.get("write_off_amount"))
@@ -1277,8 +1295,8 @@ class SalesInvoice(SellingController):
 			"taxes": ("account_head",),
 			"payments": ("account",),
 		}
-		self.needs_repost = self.check_if_fields_updated(fields_to_check, child_tables)
-		if self.needs_repost:
+		needs_repost = self.check_if_fields_updated(fields_to_check, child_tables)
+		if needs_repost:
 			self.validate_for_repost()
 			self.repost_accounting_entries()
 
@@ -1316,16 +1334,10 @@ class SalesInvoice(SellingController):
 
 	@frappe.whitelist()
 	def is_subcontracted(self):
-		if not self.has_subcontracted:
+		sales_orders = [item.sales_order for item in self.items if item.sales_order]
+		if not self.has_subcontracted and sales_orders:
 			self.has_subcontracted = bool(
-				frappe.get_cached_value(
-					"Sales Order",
-					{
-						"name": ["in", [item.sales_order for item in self.items if item.sales_order]],
-						"is_subcontracted": 1,
-					},
-					"name",
-				)
+				frappe.db.exists("Sales Order", {"name": ["in", sales_orders], "is_subcontracted": 1})
 			)
 		if self.has_subcontracted:
 			self.update_stock = 0
@@ -1362,7 +1374,8 @@ def get_bank_cash_account(mode_of_payment: str, company: str) -> dict:
 def get_loyalty_programs(customer: str) -> list:
 	from .services.loyalty import get_loyalty_programs as _get
 
-	return _get(customer)
+	frappe.has_permission("Customer", "read", customer, throw=True)
+	return _get(customer, set_single_program=frappe.has_permission("Customer", "write", customer))
 
 
 def check_if_return_invoice_linked_with_payment_entry(self):

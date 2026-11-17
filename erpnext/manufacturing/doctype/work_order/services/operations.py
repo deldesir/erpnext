@@ -231,7 +231,13 @@ class OperationsService:
 	def set_work_order_operations(self):
 		"""Fetch operations from BOM and set in 'Work Order'"""
 		self.doc.set("operations", [])
-		if not self.doc.bom_no or not frappe.get_cached_value("BOM", self.doc.bom_no, "with_operations"):
+		if not self.doc.bom_no:
+			return
+
+		# With multi-level BOM, sub-assembly operations apply even when the top-level BOM has none
+		if not self.doc.use_multi_level_bom and not frappe.get_cached_value(
+			"BOM", self.doc.bom_no, "with_operations"
+		):
 			return
 
 		operations = self._collect_bom_operations()
@@ -273,7 +279,6 @@ class OperationsService:
 			if not saved or is_fixed or flt(saved.time_in_mins) != flt(d.time_in_mins):
 				continue
 			d.time_in_mins = flt(saved.time_in_mins) * flt(self.doc.qty) / flt(previous.qty)
-		self.calculate_operating_cost()
 
 	def _get_fixed_time_flags(self):
 		boms = {d.bom or self.doc.bom_no for d in self.doc.get("operations")}

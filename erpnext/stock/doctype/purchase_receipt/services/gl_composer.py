@@ -110,10 +110,14 @@ class PurchaseReceiptGLComposer(BaseStockGLComposer):
 
 			if (
 				item.get("rejected_qty")
+				and item.item_code in stock_items
 				and not doc.is_internal_transfer()
 				and frappe.db.get_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials")
 			):
 				outgoing_amount += get_stock_value_difference(doc.name, item.name, item.rejected_warehouse)
+				if not flt(item.qty):
+					# Valuation charges are in the rejected stock value; the tax accounts are credited for them.
+					outgoing_amount -= flt(item.item_tax_amount)
 				credit_amount = outgoing_amount
 
 			if credit_amount:
@@ -361,7 +365,8 @@ class PurchaseReceiptGLComposer(BaseStockGLComposer):
 			if d.is_fixed_asset and d.landed_cost_voucher_amount:
 				doc.update_assets(d, d.valuation_rate)
 
-			if d.rejected_qty and self.is_rejected_material_valued():
+			# a non-stock item puts no rejected qty in stock
+			if d.rejected_qty and d.item_code in stock_items and self.is_rejected_material_valued():
 				stock_asset_rbnb = (
 					doc.get_company_default("asset_received_but_not_billed")
 					if d.is_fixed_asset

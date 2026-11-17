@@ -18,6 +18,7 @@ from erpnext.controllers.taxes_and_totals import init_landed_taxes_and_totals
 from erpnext.projects.doctype.project.project import update_purchase_cost
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
 from erpnext.stock.serial_batch_identity import SerialBatchIdentity
+from erpnext.utilities.query import get_match_conditions_qb
 
 
 class IncorrectCompanyValidationError(frappe.ValidationError):
@@ -65,6 +66,7 @@ class LandedCostVoucher(Document):
 		self.set("items", [])
 		for pr in self.get("purchase_receipts"):
 			if pr.receipt_document_type and pr.receipt_document:
+				check_receipt_document_access(pr.receipt_document_type, pr.receipt_document)
 				pr_items = get_pr_items(pr)
 
 				for d in pr_items:
@@ -437,10 +439,7 @@ class LandedCostVoucher(Document):
 
 	@frappe.whitelist()
 	def get_receipt_document_details(self, receipt_document_type: str, receipt_document: str):
-		if receipt_document_type not in RECEIPT_DOCUMENT_TYPES:
-			frappe.throw(_("Receipt Document Type {0} is not supported").format(receipt_document_type))
-
-		frappe.has_permission(receipt_document_type, "read", receipt_document, throw=True)
+		check_receipt_document_access(receipt_document_type, receipt_document)
 		if receipt_document_type in [
 			"Purchase Invoice",
 			"Purchase Receipt",
@@ -627,6 +626,13 @@ class LandedCostVoucher(Document):
 		}
 
 
+def check_receipt_document_access(receipt_document_type, receipt_document):
+	if receipt_document_type not in RECEIPT_DOCUMENT_TYPES:
+		frappe.throw(_("Receipt Document Type {0} is not supported").format(receipt_document_type))
+
+	frappe.has_permission(receipt_document_type, "read", receipt_document, throw=True)
+
+
 def get_pr_items(purchase_receipt):
 	item = frappe.qb.DocType("Item")
 
@@ -690,6 +696,8 @@ def get_vendor_invoices(
 		frappe.throw(_("Invalid search query"), title=_("Invalid Query"))
 
 	query = get_vendor_invoice_query(filters)
+	for condition in get_match_conditions_qb("Purchase Invoice"):
+		query = query.where(condition)
 
 	if txt:
 		query = query.where(frappe.qb.DocType(doctype).name.like(f"%{txt}%"))

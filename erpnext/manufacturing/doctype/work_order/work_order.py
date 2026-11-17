@@ -18,8 +18,9 @@ from frappe.utils import (
 	nowdate,
 )
 
+from erpnext import get_company_currency, require_permission
 from erpnext.buying.utils import check_on_hold_or_closed_status
-from erpnext.manufacturing.doctype.bom.bom import validate_bom_no
+from erpnext.manufacturing.doctype.bom.bom import validate_production_bom
 from erpnext.manufacturing.doctype.production_plan.services.work_order_quantities import (
 	ProductionPlanWorkOrderQuantities,
 )
@@ -265,14 +266,15 @@ class WorkOrder(Document):
 					"secondary_items.secondary_item_type",
 					"secondary_items.qty",
 					"secondary_items.uom",
-					"secondary_items.cost as amount",
+					"secondary_items.base_cost as amount",
 					"quantity as bom_qty",
 				],
 			).run(as_dict=True)
 			secondary_items = [item for item in secondary_items if item.item_code]
+			precision = frappe.get_precision("Work Order Additional Item", "amount")
 			for item in secondary_items:
 				item["qty"] = (item.qty / item.bom_qty) * self.qty
-				item["amount"] = flt(item.amount) * item.qty
+				item["amount"] = flt(flt(item.amount) * self.qty / item.bom_qty, precision)
 			return secondary_items
 
 	@property
@@ -322,7 +324,7 @@ class WorkOrder(Document):
 	def validate(self):
 		self.validate_production_item()
 		if self.bom_no:
-			validate_bom_no(self.production_item, self.bom_no)
+			validate_production_bom(self.production_item, self.bom_no)
 
 		if not self.subcontracting_inward_order:
 			self.validate_sales_order()
@@ -331,13 +333,14 @@ class WorkOrder(Document):
 		self.set_operation_warehouses()
 		self.validate_warehouse_belongs_to_company()
 		self.check_wip_warehouse_skip()
+		self.reset_use_multi_level_bom()
 		self.calculate_operating_cost()
 		self.validate_qty()
 		self.validate_transfer_against()
 		self.validate_operations()
 		self.status = self.get_status()
 		self.validate_workstation_type()
-		self.reset_use_multi_level_bom()
+		WorkOrderStockReservation(self).clear_reserve_stock_if_disabled()
 		WorkOrderStockReservation(self).set_reserve_stock()
 		WorkOrderStockReservation(self).validate_fg_warehouse_for_reservation()
 		self.validate_dates()
@@ -351,7 +354,10 @@ class WorkOrder(Document):
 			"Manufacturing Settings", "allow_editing_of_items_and_quantities_in_work_order"
 		):
 			self.set_required_items(reset_only_qty=len(self.get("required_items")))
+		else:
+			self.set_rate_for_edited_items()
 
+		self.set_required_item_amounts()
 		WorkOrderStockReservation(self).enable_auto_reserve_stock()
 		self.validate_operations_sequence()
 		self.validate_subcontracting_inward_order()
@@ -1071,6 +1077,8 @@ class WorkOrder(Document):
 	def make_bom(self):
 		bom = frappe.new_doc("BOM")
 		bom.item = self.production_item
+		bom.company = self.company
+		bom.currency = get_company_currency(self.company)
 		bom.conversion_rate = 1
 		bom.quantity = flt(self.produced_qty) or flt(self.qty)
 
@@ -1216,6 +1224,12 @@ class WorkOrder(Document):
 
 	def set_required_items(self, reset_only_qty=False, reset_source_warehouse=False):
 		return RequiredItemsService(self).set_required_items(reset_only_qty, reset_source_warehouse)
+
+	def set_rate_for_edited_items(self):
+		return RequiredItemsService(self).set_rate_for_edited_items()
+
+	def set_required_item_amounts(self):
+		return RequiredItemsService(self).set_required_item_amounts()
 
 	def update_transferred_qty_for_required_items(self):
 		return RequiredItemsService(self).update_transferred_qty_for_required_items()
@@ -1365,6 +1379,7 @@ def get_disassembly_available_qty(stock_entry_name: str, current_se_name: str | 
 
 @frappe.whitelist()
 def get_default_warehouse(company: str):
+	require_permission("Company", company, "select")
 	wip, fg, scrap = frappe.get_cached_value(
 		"Company", company, ["default_wip_warehouse", "default_fg_warehouse", "default_scrap_warehouse"]
 	)
